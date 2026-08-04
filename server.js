@@ -39,6 +39,16 @@ const fs = require('fs');
 const path = require('path');
 const { Signer, Provider, Contract, Transaction, Serializer, utils } = require('koilib');
 
+/* A background chain walk, a stray rejection, a bad response shape — none
+   of it should ever take the site down. A logged error serves everyone
+   better than a process that exits and leaves the host answering 503. */
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandled rejection]', (e && e.stack) || e);
+});
+process.on('uncaughtException', (e) => {
+  console.error('[uncaught exception]', (e && e.stack) || e);
+});
+
 const NETWORKS = {
   harbinger: {
     label: 'Koinos Harbinger testnet',
@@ -54,6 +64,23 @@ const NETWORKS = {
   },
 };
 
+/* Env numbers, parsed so a typo cannot kill the process. BigInt('5e8')
+   throws, and a throw out here happens at module load — before anything
+   is listening and before any log line, which from outside is an
+   unexplained 503. A bad value falls back and says so. */
+function bigEnv(name, fallback) {
+  const raw = (process.env[name] || '').trim();
+  if (!raw) return BigInt(Math.round(fallback));
+  try {
+    const n = /^[0-9]+$/.test(raw) ? BigInt(raw) : BigInt(Math.round(Number(raw)));
+    if (n > 0n) return n;
+    throw new Error('must be positive');
+  } catch (_) {
+    console.error(`[config] ${name}="${raw}" is not a whole number of satoshis — using ${fallback}`);
+    return BigInt(Math.round(fallback));
+  }
+}
+
 const CFG = {
   PORT: parseInt(process.env.PORT || '3100', 10),
   DATA_DIR: path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data-live')),
@@ -65,8 +92,8 @@ const CFG = {
      5 KOIN cap rejected nothing but did let the old 2-op listing squeak
      under a limit too small to actually execute. rc_limit is a ceiling,
      not a charge — only rc_used leaves the payer. */
-  SPONSOR_RC_PER_OP: BigInt(process.env.SPONSOR_RC_PER_OP || String(3e8)),
-  SPONSOR_RC_MAX: BigInt(process.env.SPONSOR_RC_MAX || String(15e8)),
+  SPONSOR_RC_PER_OP: bigEnv('SPONSOR_RC_PER_OP', 3e8),
+  SPONSOR_RC_MAX: bigEnv('SPONSOR_RC_MAX', 15e8),
   AURVANIA_API: (process.env.AURVANIA_API || 'https://aurvania.quest').replace(/\/$/, ''),
   ADMIN_KEY: (process.env.ADMIN_KEY || '').trim(),
 };
@@ -358,8 +385,17 @@ const EVENT_KIND = {
 };
 /* No defaultTypeName: koilib's Serializer lets a default SILENTLY win over
    the type passed per call, which would decode every event as whichever
-   type was named first. */
-const marketSerializer = MARKET_ABI.koilib_types ? new Serializer(MARKET_ABI.koilib_types) : null;
+   type was named first.
+
+   Built defensively because this runs at MODULE LOAD: a throw here would
+   kill the process before it ever listened, taking the whole site down for
+   the sake of the history panel. Losing history is the right failure. */
+let marketSerializer = null;
+try {
+  if (MARKET_ABI.koilib_types) marketSerializer = new Serializer(MARKET_ABI.koilib_types);
+} catch (e) {
+  console.error('[history] event decoding unavailable —', String((e && e.message) || e));
+}
 
 let history = loadJson(HISTORY_FILE, null) || { events: [], lastSeq: -1 };
 /* How many account-history records the last walk actually read. Without
@@ -867,6 +903,17 @@ const server = http.createServer(async (req, res) => {
     console.error('[api]', p, String(e && e.message || e).slice(0, 200));
     if (!res.headersSent) json(res, 500, { error: 'Internal error' });
   }
+});
+
+/* Say WHY rather than dying silently — a port already held by the previous
+   process is the classic restart failure, and it looks identical to a
+   crash from the outside. */
+server.on('error', (e) => {
+  console.error(`[listen] cannot bind port ${CFG.PORT}:`, String((e && e.message) || e));
+  if (e && e.code === 'EADDRINUSE') {
+    console.error('        something is already serving that port — stop the old process first');
+  }
+  process.exit(1);
 });
 
 server.listen(CFG.PORT, () => {
