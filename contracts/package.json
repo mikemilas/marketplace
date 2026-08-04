@@ -11,5 +11,8 @@
     "as-proto": "npm:@koinos/as-proto@^1.0.1",
     "assemblyscript": "^0.27.37",
     "koinos-precompiler-as": "^1.7.3"
+  },
+  "dependencies": {
+    "koilib": "^9.1.0"
   }
 }
