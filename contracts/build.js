@@ -7,8 +7,8 @@ const fs = require('fs');
 const path = require('path');
 
 const name = process.argv[2];
-if (!['market'].includes(name)) {
-  console.error('usage: node build.js <market>');
+if (!['market', 'collection'].includes(name)) {
+  console.error('usage: node build.js <market|collection>');
   process.exit(1);
 }
 const dir = path.join(__dirname, name);

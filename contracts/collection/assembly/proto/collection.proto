@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package collection;
+
+import "koinos/options.proto";
+
+// A collection anyone can launch from OURO. The audited KCS-2 contract it
+// builds on fixes name and symbol at COMPILE time, which would mean a
+// separate binary — and a separate compiler run — for every creator. Here
+// that identity lives in state instead and is written once at setup, so a
+// single reviewed binary serves every collection ever launched.
+
+message config {
+   string name = 1;
+   string symbol = 2;
+   string uri = 3;
+   string description = 4;
+   // Set the moment setup succeeds; the guard against a second setup
+   // rewriting a collection people already hold tokens from.
+   bool initialized = 5;
+}
+
+message initialize_args {
+   string name = 1;
+   string symbol = 2;
+   string uri = 3;
+   string description = 4;
+   // Who owns the collection afterwards: mints, metadata and royalties.
+   bytes owner = 5 [(koinos.btype) = ADDRESS];
+   // Creator royalty in basis points of 10000, capped at 10% — the same
+   // ceiling the marketplace will actually pay out.
+   uint64 royalty_bps = 6 [jstype = JS_STRING];
+   bytes royalty_address = 7 [(koinos.btype) = ADDRESS];
+}
+
+message initialized_event {
+   string name = 1;
+   string symbol = 2;
+   bytes owner = 3 [(koinos.btype) = ADDRESS];
+   uint64 royalty_bps = 4 [jstype = JS_STRING];
+}
