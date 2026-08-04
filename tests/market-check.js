@@ -134,6 +134,17 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
   r = await sponsor(await craft({ ops: [goodOp], rcLimit: '99900000000' }));
   check('an rc limit above the ceiling is refused', r.status === 400 && /ceiling/.test(r.body.error), JSON.stringify(r.body));
 
+  /* The mana budget that broke listing. A real Koinos contract call burns
+     roughly 0.4–1.3 KOIN, so a two-operation listing under a flat 2 KOIN
+     ceiling reverted on chain with "insufficient rc". The ceiling now
+     follows the operation count. */
+  r = await sponsor(await craft({ ops: [approveOp, goodOp], rcLimit: '600000000' }));
+  check('a 2-op listing may budget 6 KOIN of mana — the amount it actually needs',
+    !/ceiling/.test(r.body.error || ''), JSON.stringify(r.body));
+  r = await sponsor(await craft({ ops: [goodOp], rcLimit: '600000000' }));
+  check('…but a 1-op transaction may not claim that same budget',
+    r.status === 400 && /ceiling/.test(r.body.error || ''), JSON.stringify(r.body));
+
   r = await sponsor(await craft({ ops: [goodOp, evilOp] }));
   check('an op on a foreign contract is refused even next to a good one', r.status === 400 && /not something/.test(r.body.error), JSON.stringify(r.body));
 
@@ -167,6 +178,114 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
     if (rr.status === 429) { limited = true; break; }
   }
   check('a payee hammering the sponsor gets rate limited', limited, 'never hit 429');
+
+  /* ---- filters read the whole collection, not one page ---- */
+  const F = await api(`/api/collections/${RELICS}/facets`);
+  const facets = F.body.facets || [];
+  const rarity = facets.find(f => f.trait === 'Rarity');
+  check('facets are built from every token in the collection',
+    !!rarity && rarity.total === F.body.indexed && F.body.indexed > 24, JSON.stringify(F.body).slice(0, 160));
+  check('…and each trait value carries a real count',
+    !!rarity && rarity.values.every(v => v.count > 0) &&
+    rarity.values.reduce((s, v) => s + v.count, 0) === rarity.total, JSON.stringify(rarity).slice(0, 160));
+
+  const all = (await api(`/api/collections/${RELICS}/tokens?limit=1`)).body;
+  const rareOnly = (await api(`/api/collections/${RELICS}/tokens?limit=60&t=Rarity:rare`)).body;
+  const rareCount = rarity.values.find(v => v.value === 'rare')?.count;
+  check('a trait filter narrows the WHOLE collection, matching the sidebar count',
+    rareOnly.matched === rareCount && rareOnly.matched < all.matched,
+    `matched=${rareOnly.matched} facet=${rareCount} total=${all.matched}`);
+
+  const twoVals = (await api(`/api/collections/${RELICS}/tokens?limit=60&t=Rarity:rare&t=Rarity:epic`)).body;
+  const epicCount = rarity.values.find(v => v.value === 'epic')?.count || 0;
+  check('…two values of one trait are an OR', twoVals.matched === rareCount + epicCount,
+    `${twoVals.matched} vs ${rareCount}+${epicCount}`);
+
+  const crossed = (await api(`/api/collections/${RELICS}/tokens?limit=60&t=Rarity:rare&t=Kind:pet`)).body;
+  check('…while different traits are an AND', crossed.matched <= Math.min(rareOnly.matched, all.matched),
+    String(crossed.matched));
+
+  const searched = (await api(`/api/collections/${RELICS}/tokens?limit=60&q=blade`)).body;
+  check('search matches names across the collection',
+    searched.matched > 0 && searched.tokens.every(t => /blade/i.test(t.name + ' ' + t.label)),
+    JSON.stringify(searched.tokens.slice(0, 2)));
+
+  const paged = (await api(`/api/collections/${RELICS}/tokens?limit=10&offset=0`)).body;
+  const paged2 = (await api(`/api/collections/${RELICS}/tokens?limit=10&offset=10`)).body;
+  check('paging walks the filtered set without repeating',
+    paged.nextOffset === 10 && paged2.tokens.length > 0 &&
+    !paged2.tokens.some(t => paged.tokens.some(p => p.tokenId === t.tokenId)),
+    `${paged.tokens.length}/${paged2.tokens.length}`);
+
+  const nobody = (await api(`/api/collections/${RELICS}/tokens?limit=5&owner=${newSigner().getAddress()}`)).body;
+  check('an owner filter with no holdings matches nothing', nobody.matched === 0, String(nobody.matched));
+
+  /* ---- history is decoded from the contract's own events ---- */
+  const hist = await api(`/api/history?collection=${RELICS}`);
+  check('history answers for a collection with no trades yet',
+    hist.status === 200 && Array.isArray(hist.body.events), JSON.stringify(hist.body).slice(0, 120));
+
+  /* The walk itself, against the REAL contract on mainnet. "No trades yet"
+     and "the indexer never reached the chain" produce the same empty list,
+     so the record count is what separates them. */
+  {
+    const LIVE_PORT = PORT + 1;
+    const live = spawn('node', ['server.js'], {
+      cwd: ROOT,
+      env: Object.assign({}, process.env, {
+        PORT: String(LIVE_PORT),
+        DATA_DIR: path.join(SCRATCH, 'mk-live-' + process.pid),
+        KOINOS_NETWORK: 'mainnet',
+        MARKET_ADDR: '1BsZx4Hc69tWo1q9sXNP9ywvpBW2KdXwc8',
+      }),
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    try {
+      let body = null;
+      for (let i = 0; i < 60; i++) {
+        await sleep(500);
+        try {
+          const rr = await fetch(`http://127.0.0.1:${LIVE_PORT}/api/history?collection=${RELICS}`);
+          if (rr.ok) { body = await rr.json(); if (body.scanned > 0) break; }
+        } catch (_) {}
+      }
+      check('the indexer really walks the market contract\'s history on chain',
+        !!body && body.scanned > 0, JSON.stringify(body));
+      check('…and ignores the contract\'s non-trade events rather than choking on them',
+        !!body && Array.isArray(body.events) && body.known === 0, JSON.stringify(body));
+    } finally { try { live.kill(); } catch (_) {} }
+  }
+
+  /* No trade exists on the new contract yet, so prove the DECODER against
+     bytes shaped exactly like the chain's: koilib's Serializer silently
+     prefers a default type over the one passed per call, which would have
+     decoded every event as whichever type was named first. */
+  {
+    const { Serializer, utils } = require('koilib');
+    const s = new Serializer(marketAbi.koilib_types);
+    const sold = {
+      buyer: user.getAddress(), seller: dev.getAddress(), collection: RELICS,
+      token_id: '0x4352534449544d30303031', price: '2500000000',
+      protocol_fee: '62500000', royalties_paid: '25000000',
+    };
+    const wire = utils.encodeBase64url(await s.serialize(sold, 'market.execute_order_event'));
+    const back = await s.deserialize(utils.decodeBase64url(wire), 'market.execute_order_event');
+    check('a sale event decodes with buyer, seller, price, fee and royalty intact',
+      back.buyer === sold.buyer && back.seller === sold.seller && back.price === sold.price &&
+      back.protocol_fee === sold.protocol_fee && back.royalties_paid === sold.royalties_paid,
+      JSON.stringify(back));
+    const net = BigInt(back.price) - BigInt(back.protocol_fee) - BigInt(back.royalties_paid);
+    check('…and the seller\'s take is the price minus both cuts', net === 2412500000n, String(net));
+
+    const listed = await s.deserialize(
+      utils.decodeBase64url(utils.encodeBase64url(await s.serialize(
+        { seller: dev.getAddress(), collection: RELICS, token_id: '0x01', price: '900', expires: '0' },
+        'market.create_order_event'))),
+      'market.create_order_event');
+    check('a listing event decodes as a LISTING, not as whichever type came first',
+      listed.price === '900' && listed.buyer === undefined && listed.seller === dev.getAddress(),
+      JSON.stringify(listed));
+  }
 
   console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');
   process.exit(fails ? 1 : 0);

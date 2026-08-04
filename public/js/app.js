@@ -211,11 +211,34 @@ async function homeView() {
     ${collections.length ? '' : '<div class="empty">No collections registered yet.</div>'}`;
 }
 
-async function collectionView(addr) {
+/* The collection page keeps its filters IN THE URL, so a filtered view can
+   be shared, bookmarked and reloaded. Changing a filter rewrites the query
+   and repaints the grid alone — repainting the whole page would throw away
+   the sidebar's scroll position on every click. */
+async function collectionView(addr, queryString) {
   view.innerHTML = '<div class="loading"><span class="spin"></span> Loading collection…</div>';
-  const data = await api('/collections/' + addr);
+  const state = new URLSearchParams(queryString || '');
+  const [data, facetData] = await Promise.all([
+    api('/collections/' + addr),
+    api(`/collections/${addr}/facets`).catch(() => ({ facets: [], indexed: 0, partial: false })),
+  ]);
   const info = data.info || {};
-  const tab = (name, label) => `<button class="tab" data-tab="${name}">${label}</button>`;
+
+  const activeTraits = () => {
+    const m = new Map();
+    for (const raw of state.getAll('t')) {
+      const i = raw.indexOf(':');
+      if (i < 1) continue;
+      const k = raw.slice(0, i);
+      if (!m.has(k)) m.set(k, new Set());
+      m.get(k).add(raw.slice(i + 1));
+    }
+    return m;
+  };
+  const filterCount = () => state.getAll('t').length
+    + (state.get('status') && state.get('status') !== 'all' ? 1 : 0)
+    + (state.get('q') ? 1 : 0);
+
   view.innerHTML = `
     <div class="c-head">
       <div class="c-title">
@@ -229,53 +252,165 @@ async function collectionView(addr) {
         <div class="hstat"><b>${((info.royaltyBps || 0) / 100).toFixed(1)}%</b><span>royalty</span></div>
       </div>
     </div>
-    <div class="tabs">${tab('listings', 'Listings')}${tab('browse', 'Browse')}${tab('mine', 'My items')}</div>
-    <div id="c-body"></div>`;
+    <div class="c-layout">
+      <aside class="c-side" id="c-side"></aside>
+      <div class="c-main">
+        <div class="c-toolbar">
+          <button class="btn filt-toggle" id="c-filt-open">☰ Filters<span id="c-filt-n"></span></button>
+          <input id="c-search" type="search" placeholder="Search by name" value="${esc(state.get('q') || '')}">
+          <select id="c-sort">
+            <option value="default">Sort: default</option>
+            <option value="price_asc">Price: low to high</option>
+            <option value="price_desc">Price: high to low</option>
+            <option value="name">Name A–Z</option>
+          </select>
+          <span class="c-count" id="c-count"></span>
+        </div>
+        <div id="c-grid"></div>
+      </div>
+    </div>`;
 
-  const body = $('#c-body');
-  const tabs = [...view.querySelectorAll('.tab')];
-  const activate = async (name) => {
-    tabs.forEach((t) => t.classList.toggle('on', t.dataset.tab === name));
-    if (name === 'listings') {
-      if (!data.orders.length) { body.innerHTML = '<div class="empty">Nothing listed right now.</div>'; return; }
-      body.innerHTML = '<div class="loading"><span class="spin"></span></div>';
-      // The orders carry ids; the art comes per token.
-      const cards = await Promise.all(data.orders.map(async (o) => {
-        try {
-          const t = await api(`/collections/${addr}/token/${encodeURIComponent(o.tokenId)}`);
-          return tokCard(addr, { tokenId: o.tokenId, label: o.label, name: t.meta?.name, image: t.meta?.image, order: o });
-        } catch (_) { return tokCard(addr, { tokenId: o.tokenId, label: o.label, order: o }); }
-      }));
-      body.innerHTML = `<div class="grid">${cards.join('')}</div>`;
-    } else if (name === 'browse') {
-      body.innerHTML = '<div class="loading"><span class="spin"></span></div>';
-      let start = '';
-      const page = async () => {
-        const q = await api(`/collections/${addr}/tokens?limit=24${start ? '&start=' + encodeURIComponent(start) : ''}`);
-        const grid = body.querySelector('.grid') || (() => { body.innerHTML = '<div class="grid"></div>'; return body.querySelector('.grid'); })();
-        grid.insertAdjacentHTML('beforeend', q.tokens.map((t) => tokCard(addr, t)).join(''));
-        body.querySelector('.load-more')?.remove();
-        if (q.nextStart) {
-          start = q.nextStart;
-          body.insertAdjacentHTML('beforeend', '<button class="btn load-more">Load more</button>');
-          body.querySelector('.load-more').onclick = page;
-        } else if (!grid.children.length) {
-          body.innerHTML = '<div class="empty">This collection has not minted anything yet — or does not support browsing.</div>';
-        }
-      };
-      await page();
-    } else if (name === 'mine') {
-      if (!Wallet.account) { body.innerHTML = '<div class="empty">Connect a wallet to see your items.</div>'; return; }
-      body.innerHTML = '<div class="loading"><span class="spin"></span></div>';
-      const mine = await api('/owned?address=' + Wallet.account.address);
-      const col = mine.collections.find((c) => c.collection.address === addr);
-      body.innerHTML = col && col.tokens.length
-        ? `<div class="grid">${col.tokens.map((t) => tokCard(addr, t)).join('')}</div>`
-        : '<div class="empty">You own nothing from this collection yet.</div>';
-    }
+  const side = $('#c-side');
+  const grid = $('#c-grid');
+  $('#c-sort').value = state.get('sort') || 'default';
+
+  /* Rewrite the address bar without navigating: a hashchange here would
+     re-enter route() and rebuild the page we are standing on. */
+  const syncUrl = () => {
+    const qs = state.toString();
+    history.replaceState(null, '', `#/c/${addr}${qs ? '?' + qs : ''}`);
   };
-  tabs.forEach((t) => (t.onclick = () => activate(t.dataset.tab)));
-  activate(data.orders.length ? 'listings' : 'browse');
+
+  const paintSidebar = () => {
+    const active = activeTraits();
+    const status = state.get('status') || 'all';
+    const n = filterCount();
+    $('#c-filt-n').textContent = n ? ` (${n})` : '';
+    side.innerHTML = `
+      <div class="side-head">
+        <b>Filters</b>
+        ${n ? '<button class="linkish" id="c-clear">Clear all</button>' : ''}
+        <button class="side-x" id="c-filt-close" aria-label="Close filters">✕</button>
+      </div>
+      <div class="facet">
+        <div class="facet-h">Status</div>
+        ${[['all', 'Everything'], ['listed', 'For sale'], ['unlisted', 'Not listed'], ['mine', 'Mine']]
+          .map(([v, label]) => `
+          <label class="fopt${v === 'mine' && !Wallet.account ? ' dim' : ''}">
+            <input type="radio" name="c-status" value="${v}"${status === v ? ' checked' : ''}>
+            <span>${label}</span>
+          </label>`).join('')}
+      </div>
+      ${facetData.facets.map((f, i) => `
+        <div class="facet">
+          <div class="facet-h">${esc(f.trait)}</div>
+          <div class="facet-vals${f.values.length > 8 ? ' scrolly' : ''}">
+            ${f.values.map((v) => {
+              const on = active.get(f.trait)?.has(String(v.value));
+              return `<label class="fopt">
+                <input type="checkbox" data-trait="${esc(f.trait)}" value="${esc(String(v.value))}"${on ? ' checked' : ''}>
+                <span>${esc(String(v.value))}</span><em>${v.count}</em>
+              </label>`;
+            }).join('')}
+          </div>
+        </div>`).join('')}
+      ${facetData.facets.length ? '' : '<div class="facet dim">This collection publishes no traits to filter on.</div>'}
+      ${facetData.partial ? `<div class="facet dim">Filters cover the first ${facetData.indexed} items of this collection.</div>` : ''}`;
+
+    side.querySelectorAll('input[name="c-status"]').forEach((el) => {
+      el.onchange = () => {
+        if (el.value === 'mine' && !Wallet.account) { connectModal(); return paintSidebar(); }
+        state.set('status', el.value);
+        apply();
+      };
+    });
+    side.querySelectorAll('input[type="checkbox"][data-trait]').forEach((el) => {
+      el.onchange = () => {
+        const key = `${el.dataset.trait}:${el.value}`;
+        const kept = state.getAll('t').filter((x) => x !== key);
+        state.delete('t');
+        for (const k of kept) state.append('t', k);
+        if (el.checked) state.append('t', key);
+        apply();
+      };
+    });
+    const clear = side.querySelector('#c-clear');
+    if (clear) clear.onclick = () => {
+      for (const k of ['t', 'status', 'q']) state.delete(k);
+      $('#c-search').value = '';
+      apply();
+    };
+    side.querySelector('#c-filt-close').onclick = () => {
+      side.classList.remove('open');
+      view.querySelector('.c-layout')?.classList.remove('filters-open');
+    };
+  };
+
+  let reqId = 0;
+  const paintGrid = async () => {
+    const mine = state.get('status') === 'mine';
+    const params = new URLSearchParams();
+    for (const t of state.getAll('t')) params.append('t', t);
+    const status = state.get('status') || 'all';
+    if (status !== 'all' && status !== 'mine') params.set('status', status);
+    if (mine && Wallet.account) params.set('owner', Wallet.account.address);
+    if (state.get('q')) params.set('q', state.get('q'));
+    if (state.get('sort') && state.get('sort') !== 'default') params.set('sort', state.get('sort'));
+
+    const mine_ = ++reqId;
+    grid.innerHTML = '<div class="loading"><span class="spin"></span></div>';
+    let offset = 0;
+    const page = async () => {
+      const q = await api(`/collections/${addr}/tokens?limit=24&offset=${offset}&${params}`);
+      if (mine_ !== reqId) return;                 // a newer filter won
+      $('#c-count').textContent = `${q.matched.toLocaleString('en-US')} item${q.matched === 1 ? '' : 's'}`;
+      if (!offset) {
+        grid.innerHTML = q.matched
+          ? '<div class="grid"></div>'
+          : '<div class="empty">Nothing matches these filters.</div>';
+      }
+      const g = grid.querySelector('.grid');
+      if (!g) return;
+      g.insertAdjacentHTML('beforeend', q.tokens.map((t) => tokCard(addr, t)).join(''));
+      grid.querySelector('.load-more')?.remove();
+      if (q.nextOffset != null) {
+        offset = q.nextOffset;
+        grid.insertAdjacentHTML('beforeend', '<button class="btn load-more">Load more</button>');
+        grid.querySelector('.load-more').onclick = page;
+      }
+    };
+    try { await page(); }
+    catch (e) { if (mine_ === reqId) grid.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  };
+
+  const apply = () => { syncUrl(); paintSidebar(); paintGrid(); };
+
+  $('#c-sort').onchange = (e) => { state.set('sort', e.target.value); apply(); };
+  let searchTimer;
+  $('#c-search').oninput = (e) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      const v = e.target.value.trim();
+      if (v) state.set('q', v); else state.delete('q');
+      syncUrl(); paintGrid();
+    }, 250);
+  };
+  const layout = view.querySelector('.c-layout');
+  const drawer = (open) => {
+    side.classList.toggle('open', open);
+    layout.classList.toggle('filters-open', open);
+  };
+  $('#c-filt-open').onclick = () => drawer(true);
+  // The backdrop is a pseudo-element, so its clicks land on the layout.
+  layout.onclick = (e) => { if (e.target === layout) drawer(false); };
+  document.addEventListener('keydown', function esc(e) {
+    if (!layout.isConnected) return document.removeEventListener('keydown', esc);
+    if (e.key === 'Escape') drawer(false);
+  });
+
+  // Land on what is for sale when there is something for sale.
+  if (!state.get('status') && data.orders.length) state.set('status', 'listed');
+  apply();
 }
 
 async function tokenView(addr, tokenId) {
@@ -303,10 +438,8 @@ async function tokenView(addr, tokenId) {
     }
     if (isOwner) {
       return `
-        <label for="t-price">List for sale — price in KOIN</label>
-        <input id="t-price" type="number" min="0" step="0.00000001" placeholder="e.g. 25">
-        <div class="fee-note" style="margin-top:6px">You receive the price minus ${(feeBps / 100).toFixed(1)}% platform fee${royBps ? ` and ${(royBps / 100).toFixed(1)}% creator royalty` : ''}. The NFT stays in your wallet until it sells.</div>
-        <div class="row"><button class="btn primary big" id="t-list">List it</button></div>`;
+        <div class="fee-note">You own this. Listing it costs you nothing — the NFT stays in your wallet until it sells.</div>
+        <div class="row"><a class="btn primary big" href="#/list/${addr}/${encodeURIComponent(tokenId)}">List Item</a></div>`;
     }
     return `<div class="fee-note">Not listed for sale.${t.owner ? '' : ' This token may not exist yet.'}</div>`;
   };
@@ -323,8 +456,11 @@ async function tokenView(addr, tokenId) {
         <div class="deal" id="t-deal">${dealHtml()}</div>
         ${t.meta?.attributes?.length ? `<div class="attrs">${t.meta.attributes.map((a) => `
           <div class="attr"><span>${esc(a.trait_type || a.name || '')}</span><b>${esc(String(a.value ?? ''))}</b></div>`).join('')}</div>` : ''}
+        <div id="t-history"></div>
       </div>
     </div>`;
+
+  paintHistory($('#t-history'), addr, tokenId);
 
   /* An action, then patient polling: the receipt comes back fast but the
      read layer only sees the new state once the block lands and the cache
@@ -352,19 +488,6 @@ async function tokenView(addr, tokenId) {
     } catch (e) { toast(esc(e.message), 'bad', 7000); tokenView(addr, tokenId); }
   };
 
-  const listBtn = $('#t-list');
-  if (listBtn) listBtn.onclick = async () => {
-    const koin = parseFloat($('#t-price').value);
-    if (!(koin > 0)) return toast('Set a price first', 'bad');
-    const sats = BigInt(Math.round(koin * 1e8)).toString();
-    busy(listBtn, 'Listing…');
-    try {
-      await Wallet.listToken(addr, tokenId, sats, { approved: t.approved });
-      toast('Listing sent — waiting for the block…');
-      follow((f) => f.order && !f.order.dead, 'Listed. It stays in your wallet until it sells.');
-    } catch (e) { toast(esc(e.message), 'bad', 7000); tokenView(addr, tokenId); }
-  };
-
   const cancelBtn = $('#t-cancel');
   if (cancelBtn) cancelBtn.onclick = async () => {
     busy(cancelBtn, 'Cancelling…');
@@ -373,6 +496,161 @@ async function tokenView(addr, tokenId) {
       toast('Cancel sent — waiting for the block…');
       follow((f) => !f.order || f.order.dead, 'Listing cancelled.');
     } catch (e) { toast(esc(e.message), 'bad', 7000); tokenView(addr, tokenId); }
+  };
+}
+
+/* What has happened to this token before — read from the contract's own
+   events, so a sale made straight against the contract still shows up. */
+const WHEN = (ms) => {
+  if (!ms) return '';
+  const d = new Date(Number(ms));
+  const days = (Date.now() - Number(ms)) / 86400000;
+  if (days < 1) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (days < 300) return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+async function paintHistory(el, addr, tokenId) {
+  if (!el) return;
+  let events = [];
+  try {
+    const r = await api(`/history?collection=${addr}&token_id=${encodeURIComponent(tokenId)}`);
+    events = r.events || [];
+  } catch (_) { return; }
+  if (!events.length) {
+    el.innerHTML = '<div class="hist"><div class="hist-h">History</div><div class="fee-note">No listings or sales yet — this one has never been to market.</div></div>';
+    return;
+  }
+  const who = (a) => `<a class="mono" href="${Wallet.cfg.explorer}/address/${esc(a || '')}" target="_blank" rel="noopener">${esc(short(a))}</a>`;
+  const line = (e) => {
+    const tx = e.tx ? `<a class="hist-tx" href="${Wallet.cfg.explorer}/tx/${esc(e.tx)}" target="_blank" rel="noopener" title="View transaction">↗</a>` : '';
+    if (e.kind === 'sold') {
+      const net = e.price ? (BigInt(e.price) - BigInt(e.fee || 0) - BigInt(e.royalty || 0)).toString() : null;
+      return `<div class="hist-row sold">
+        <span class="hist-tag">Sold</span>
+        <span class="hist-what">${who(e.seller)} → ${who(e.buyer)}${net ? `<em>seller received ${KOIN(net)} KOIN</em>` : ''}</span>
+        <span class="hist-amt">${KOIN(e.price)} KOIN</span>
+        <span class="hist-when">${WHEN(e.at)}${tx}</span></div>`;
+    }
+    if (e.kind === 'cancelled') {
+      return `<div class="hist-row cancelled">
+        <span class="hist-tag">Cancelled</span>
+        <span class="hist-what">by ${who(e.seller)}</span>
+        <span class="hist-amt">—</span>
+        <span class="hist-when">${WHEN(e.at)}${tx}</span></div>`;
+    }
+    return `<div class="hist-row listed">
+      <span class="hist-tag">Listed</span>
+      <span class="hist-what">by ${who(e.seller)}</span>
+      <span class="hist-amt">${KOIN(e.price)} KOIN</span>
+      <span class="hist-when">${WHEN(e.at)}${tx}</span></div>`;
+  };
+  el.innerHTML = `<div class="hist"><div class="hist-h">History</div>${events.map(line).join('')}</div>`;
+}
+
+/* Listing is its own page: the price, what each cut takes, and what
+   actually lands in your wallet — all visible before you commit. */
+async function listView(addr, tokenId) {
+  if (!Wallet.account) { connectModal(); }
+  view.innerHTML = '<div class="loading"><span class="spin"></span> Loading item…</div>';
+  const t = await api(`/collections/${addr}/token/${encodeURIComponent(tokenId)}`);
+  const me = Wallet.account && Wallet.account.address;
+  const back = `#/t/${addr}/${encodeURIComponent(tokenId)}`;
+
+  if (!me) {
+    view.innerHTML = `<div class="empty">Connect a wallet to list this item. <a href="${back}">Back to the item</a></div>`;
+    return;
+  }
+  if (t.owner !== me) {
+    view.innerHTML = `<div class="empty">This item is not in your wallet, so you cannot list it. <a href="${back}">Back to the item</a></div>`;
+    return;
+  }
+
+  const feeBps = Wallet.cfg.feeBps || 250;
+  const royBps = t.collection.royaltyBps || 0;
+
+  view.innerHTML = `
+    <a class="crumb" href="${back}">← ${esc(t.meta?.name || t.label)}</a>
+    <div class="list-wrap">
+      <div class="list-item">
+        <div class="t-art">${t.meta?.image ? `<img src="${esc(t.meta.image)}" alt="">` : '<div class="ph">🖼️</div>'}</div>
+        <div>
+          <h2>${esc(t.meta?.name || t.label)}</h2>
+          <div class="kv">${esc(t.collection.name || addr)} · <span class="mono">${esc(t.label)}</span></div>
+          ${t.meta?.description ? `<p class="sub" style="margin-top:8px">${esc(t.meta.description)}</p>` : ''}
+          ${t.meta?.attributes?.length ? `<div class="attrs">${t.meta.attributes.map((a) => `
+            <div class="attr"><span>${esc(a.trait_type || a.name || '')}</span><b>${esc(String(a.value ?? ''))}</b></div>`).join('')}</div>` : ''}
+        </div>
+      </div>
+
+      <div class="list-panel">
+        <h3>List for sale</h3>
+        <label for="l-price">Your price</label>
+        <div class="price-field">
+          <input id="l-price" type="number" min="0" step="0.00000001" placeholder="0.00" inputmode="decimal" autofocus>
+          <span>KOIN</span>
+        </div>
+
+        <div class="breakdown" id="l-break"></div>
+
+        <button class="btn primary big" id="l-go" disabled>List it</button>
+        <div class="fee-note">The NFT stays in your wallet until someone buys it. You can cancel any
+        time. Mana fees are on us${t.approved ? '' : ', including the one-off approval this first listing needs'}.</div>
+      </div>
+    </div>`;
+
+  const priceEl = $('#l-price');
+  const breakEl = $('#l-break');
+  const goBtn = $('#l-go');
+
+  const row = (label, value, cls = '') => `<div class="brow ${cls}"><span>${label}</span><b>${value}</b></div>`;
+  const repaint = () => {
+    const koin = parseFloat(priceEl.value);
+    const ok = koin > 0 && Number.isFinite(koin);
+    goBtn.disabled = !ok;
+    if (!ok) {
+      breakEl.innerHTML =
+        row('Platform fee', `${(feeBps / 100).toFixed(2)}%`) +
+        (royBps ? row('Collection royalty', `${(royBps / 100).toFixed(2)}%`) : '') +
+        row('You receive', 'enter a price', 'total');
+      return;
+    }
+    const sats = BigInt(Math.round(koin * 1e8));
+    const fee = (sats * BigInt(feeBps)) / 10000n;
+    const roy = (sats * BigInt(royBps)) / 10000n;
+    const net = sats - fee - roy;
+    breakEl.innerHTML =
+      row('Listing price', `${KOIN(sats.toString())} KOIN`) +
+      row(`Platform fee · ${(feeBps / 100).toFixed(2)}%`, `− ${KOIN(fee.toString())} KOIN`, 'minus') +
+      (royBps ? row(`Collection royalty · ${(royBps / 100).toFixed(2)}%`, `− ${KOIN(roy.toString())} KOIN`, 'minus') : '') +
+      row('You receive', `${KOIN(net.toString())} KOIN`, 'total');
+  };
+  priceEl.oninput = repaint;
+  repaint();
+
+  goBtn.onclick = async () => {
+    const koin = parseFloat(priceEl.value);
+    if (!(koin > 0)) return toast('Set a price first', 'bad');
+    const sats = BigInt(Math.round(koin * 1e8)).toString();
+    goBtn.disabled = true;
+    goBtn.innerHTML = '<span class="spin"></span> Listing…';
+    try {
+      await Wallet.listToken(addr, tokenId, sats, { approved: t.approved });
+      toast('Listing sent — waiting for the block…');
+      location.hash = back;
+      // The token page polls for the order to appear.
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const f = await api(`/collections/${addr}/token/${encodeURIComponent(tokenId)}`);
+          if (f.order && !f.order.dead) { toast('Listed. It stays in your wallet until it sells.', 'good', 6000); return route(); }
+        } catch (_) {}
+      }
+    } catch (e) {
+      toast(esc(e.message), 'bad', 8000);
+      goBtn.disabled = false;
+      goBtn.textContent = 'List it';
+    }
   };
 }
 
@@ -399,8 +677,9 @@ async function route() {
   const h = location.hash || '#/';
   try {
     let m;
-    if ((m = /^#\/c\/([1-9A-HJ-NP-Za-km-z]+)$/.exec(h))) return await collectionView(m[1]);
-    if ((m = /^#\/t\/([1-9A-HJ-NP-Za-km-z]+)\/([^/]+)$/.exec(h))) return await tokenView(m[1], decodeURIComponent(m[2]));
+    if ((m = /^#\/c\/([1-9A-HJ-NP-Za-km-z]+)(?:\?(.*))?$/.exec(h))) return await collectionView(m[1], m[2] || '');
+    if ((m = /^#\/t\/([1-9A-HJ-NP-Za-km-z]+)\/([^/?]+)$/.exec(h))) return await tokenView(m[1], decodeURIComponent(m[2]));
+    if ((m = /^#\/list\/([1-9A-HJ-NP-Za-km-z]+)\/([^/?]+)$/.exec(h))) return await listView(m[1], decodeURIComponent(m[2]));
     if (h === '#/me') return await meView();
     return await homeView();
   } catch (e) {
@@ -416,8 +695,9 @@ function paintHeader() {
 
 (async () => {
   const cfg = await Wallet.init();
-  $('#net-chip').textContent = cfg.networkLabel || cfg.network;
-  $('#foot-market').textContent = cfg.market ? `market ${cfg.market}` : 'contract not deployed yet';
+  $('#foot-market').textContent = cfg.market
+    ? `${cfg.networkLabel || cfg.network} · market ${cfg.market}`
+    : 'contract not deployed yet';
   paintHeader();
   Wallet.onChange(() => { paintHeader(); route(); });
   $('#btn-connect').onclick = () => (Wallet.account ? walletModal() : connectModal());

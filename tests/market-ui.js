@@ -56,6 +56,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     i.src = 'https://aurvania.quest/assets/img/icon-192.png?probe=' + Math.random();
   }));
 
+  const RELICS = '1E8hw3NiDPz9gcZ8BiWoTHzFz4H48dpFKq';
+  const TOKEN = '0x4352534449544d30303031';   // Blood Blade +1, minted on mainnet
+
   // ---- home ----
   await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'networkidle' });
   await page.waitForSelector('.col-card', { timeout: 30000 });
@@ -140,6 +143,132 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     cover.centre && cover.left && cover.right && cover.slotH === cover.wrapH, JSON.stringify(cover));
   check('…right to the top and bottom edges, not just the middle',
     cover.top && cover.bottom, JSON.stringify(cover));
+
+  await page.keyboard.press('Escape');
+
+  /* ---- the filter sidebar ---- */
+  await page.goto(`http://127.0.0.1:${PORT}/#/c/${RELICS}`, { waitUntil: 'load' });
+  await page.waitForSelector('.c-side .facet', { timeout: 30000 });
+  await page.waitForFunction(() => /\d/.test(document.querySelector('#c-count')?.textContent || ''), { timeout: 30000 });
+
+  const sidebar = await page.evaluate(() => {
+    const traits = [...document.querySelectorAll('.c-side .facet-h')].map(e => e.textContent);
+    const counts = [...document.querySelectorAll('.c-side .fopt em')].map(e => Number(e.textContent));
+    return { traits, counts, total: document.querySelector('#c-count').textContent };
+  });
+  check('the collection page has a filter sidebar built from the metadata',
+    sidebar.traits.includes('Status') && sidebar.traits.includes('Rarity'), JSON.stringify(sidebar.traits));
+  check('…every trait value shows how many items carry it',
+    sidebar.counts.length > 3 && sidebar.counts.every(n => n > 0), JSON.stringify(sidebar.counts.slice(0, 6)));
+
+  // Everything, then narrowed to one rarity — the grid and count must follow.
+  await page.click('.c-side .fopt input[value="all"]');
+  await page.waitForFunction(() => !/^0 /.test(document.querySelector('#c-count').textContent), { timeout: 20000 });
+  const before = await page.evaluate(() => ({
+    count: document.querySelector('#c-count').textContent,
+    cards: document.querySelectorAll('.tok-card').length,
+  }));
+  const rareCount = await page.evaluate(() => {
+    const box = [...document.querySelectorAll('.c-side .facet')].find(f => f.querySelector('.facet-h')?.textContent === 'Rarity');
+    const opt = [...box.querySelectorAll('.fopt')].find(o => /rare/i.test(o.querySelector('span').textContent));
+    const n = Number(opt.querySelector('em').textContent);
+    opt.querySelector('input').click();
+    return n;
+  });
+  await page.waitForFunction((n) => document.querySelector('#c-count').textContent.startsWith(String(n)),
+    rareCount, { timeout: 20000 });
+  const after = await page.evaluate(() => ({
+    count: document.querySelector('#c-count').textContent,
+    cards: document.querySelectorAll('.tok-card').length,
+    hash: location.hash,
+  }));
+  check('ticking a trait filters the whole collection, not just the loaded page',
+    after.count.startsWith(String(rareCount)) && after.count !== before.count, `${before.count} -> ${after.count}`);
+  check('…the grid actually repaints to the filtered set',
+    after.cards > 0 && after.cards <= rareCount, `${after.cards} cards for ${rareCount} matches`);
+  check('…and the filter lives in the URL, so the view can be shared',
+    /t=Rarity/.test(decodeURIComponent(after.hash)), after.hash);
+  await page.screenshot({ path: `${SCRATCH}/mk-5-filters.png`, fullPage: false });
+
+  // A shared filtered URL must come back filtered.
+  await page.goto(`http://127.0.0.1:${PORT}/#/c/${RELICS}?t=Rarity%3Arare`, { waitUntil: 'load' });
+  await page.waitForFunction(() => /\d/.test(document.querySelector('#c-count')?.textContent || ''), { timeout: 30000 });
+  const reloaded = await page.evaluate(() => ({
+    count: document.querySelector('#c-count').textContent,
+    checked: !!document.querySelector('.c-side input[type=checkbox]:checked'),
+  }));
+  check('a shared filter URL reopens filtered, with the box still ticked',
+    reloaded.count.startsWith(String(rareCount)) && reloaded.checked, JSON.stringify(reloaded));
+
+  /* ---- the item page hands listing to its own page ---- */
+  const owned = await (await fetch(`http://127.0.0.1:${PORT}/api/collections/${RELICS}/token/${TOKEN}`)).json();
+  await page.goto(`http://127.0.0.1:${PORT}/#/t/${RELICS}/${TOKEN}`, { waitUntil: 'load' });
+  await page.waitForSelector('.t-info h2', { timeout: 20000 });
+  await page.waitForSelector('#t-history .hist', { timeout: 20000 });
+  const hist = await page.evaluate(() => document.querySelector('#t-history').innerText);
+  check('the item page carries a history section', /History/i.test(hist), hist.slice(0, 80));
+  check('…which says so plainly when the item has never been to market',
+    /never been to market|No listings/i.test(hist), hist.slice(0, 120));
+
+  /* Pretend to be the holder — the real one, from chain — so the owner's
+     path can be driven without a funded wallet in the sandbox. */
+  await page.evaluate((addr) => {
+    Object.defineProperty(Wallet, 'account', { get: () => ({ kind: 'hosted', address: addr }), configurable: true });
+  }, owned.owner);
+  await page.evaluate(() => route());
+  await page.waitForSelector('.deal a[href^="#/list/"]', { timeout: 20000 });
+  const listCta = await page.evaluate(() => {
+    const a = document.querySelector('.deal a[href^="#/list/"]');
+    return { text: a.textContent.trim(), href: a.getAttribute('href'), priceInputs: document.querySelectorAll('.deal input').length };
+  });
+  check('the owner gets a single "List Item" button, not a price form',
+    /List Item/i.test(listCta.text) && listCta.priceInputs === 0, JSON.stringify(listCta));
+  const ctaBox = await page.evaluate(() => {
+    const a = document.querySelector('.deal a[href^="#/list/"]');
+    const r = a.getBoundingClientRect();
+    return { h: Math.round(r.height), display: getComputedStyle(a).display };
+  });
+  check('…and it renders as a real button, not a bare link',
+    ctaBox.h >= 40 && /flex/.test(ctaBox.display), JSON.stringify(ctaBox));
+  await page.screenshot({ path: `${SCRATCH}/mk-7-owner.png` });
+
+  /* ---- the listing page ---- */
+  await page.goto(`http://127.0.0.1:${PORT}/#/list/${RELICS}/${TOKEN}`, { waitUntil: 'load' });
+  await page.evaluate((addr) => {
+    Object.defineProperty(Wallet, 'account', { get: () => ({ kind: 'hosted', address: addr }), configurable: true });
+  }, owned.owner);
+  await page.evaluate(() => route());
+  await page.waitForSelector('#l-price', { timeout: 20000 });
+  const listPage = await page.evaluate(() => ({
+    art: !!document.querySelector('.list-item .t-art img'),
+    name: document.querySelector('.list-item h2')?.textContent,
+    attrs: document.querySelectorAll('.list-item .attr').length,
+    disabled: document.querySelector('#l-go').disabled,
+  }));
+  check('the listing page shows the item art, name and details',
+    listPage.art && !!listPage.name && listPage.attrs > 0, JSON.stringify(listPage));
+  check('…and will not list until a price is entered', listPage.disabled === true, String(listPage.disabled));
+
+  await page.fill('#l-price', '200');
+  await page.waitForFunction(() => /200/.test(document.querySelector('#l-break').innerText), { timeout: 10000 });
+  const breakdown = await page.evaluate(() => ({
+    text: document.querySelector('#l-break').innerText,
+    total: document.querySelector('.brow.total b').textContent,
+    disabled: document.querySelector('#l-go').disabled,
+  }));
+  check('…the breakdown names the platform fee', /Platform fee/i.test(breakdown.text), breakdown.text);
+  // 200 KOIN at 2.5% = 5 KOIN platform fee; relics carry no royalty, so 195 lands.
+  check('…and the final received amount is the price minus every cut',
+    /5\b/.test(breakdown.text) && /195/.test(breakdown.total), `${breakdown.text} | total=${breakdown.total}`);
+  check('…with the List button live once a price is set', breakdown.disabled === false, String(breakdown.disabled));
+  await page.screenshot({ path: `${SCRATCH}/mk-6-list.png` });
+
+  /* ---- the header chip is gone ---- */
+  const chip = await page.evaluate(() => ({
+    net: !!document.querySelector('#net-chip'),
+    header: document.querySelector('.top-actions').innerText.trim(),
+  }));
+  check('the network chip beside "My items" is gone', !chip.net && !/Koinos/.test(chip.header), JSON.stringify(chip));
 
   check('no script errors anywhere', errs.length === 0, errs.slice(0, 2).join(' | '));
 

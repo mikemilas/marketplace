@@ -27,7 +27,9 @@
      KOINOS_RPC         override RPC url(s), comma separated
      MARKET_ADDR        the deployed marketplace contract address
      KOINOS_DEV_WIF     the mana payer (sponsorship off without it)
-     SPONSOR_RC_MAX     per-tx mana cap in satoshis (default 5 KOIN)
+     SPONSOR_RC_PER_OP  mana ceiling per operation in satoshis (default 3 KOIN)
+     SPONSOR_RC_MAX     absolute per-tx mana ceiling (default 15 KOIN)
+     INDEX_MAX_TOKENS   how deep a collection is indexed for filters (default 1500)
      AURVANIA_API       game server for shared sign-in (default aurvania.quest)
      ADMIN_KEY          enables POST /api/collections (registry writes)
    ============================================================ */
@@ -35,7 +37,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { Signer, Provider, Contract, Transaction, utils } = require('koilib');
+const { Signer, Provider, Contract, Transaction, Serializer, utils } = require('koilib');
 
 const NETWORKS = {
   harbinger: {
@@ -58,7 +60,13 @@ const CFG = {
   NETWORK: (process.env.KOINOS_NETWORK || 'mainnet').trim(),
   MARKET_ADDR: (process.env.MARKET_ADDR || '').trim(),
   DEV_WIF: (process.env.KOINOS_DEV_WIF || '').trim(),
-  SPONSOR_RC_MAX: BigInt(process.env.SPONSOR_RC_MAX || String(5e8)),
+  /* Mana ceilings. A Koinos contract call really costs ~0.4–1.3 KOIN of
+     mana, so a ceiling is per-OPERATION with a hard absolute cap; a flat
+     5 KOIN cap rejected nothing but did let the old 2-op listing squeak
+     under a limit too small to actually execute. rc_limit is a ceiling,
+     not a charge — only rc_used leaves the payer. */
+  SPONSOR_RC_PER_OP: BigInt(process.env.SPONSOR_RC_PER_OP || String(3e8)),
+  SPONSOR_RC_MAX: BigInt(process.env.SPONSOR_RC_MAX || String(15e8)),
   AURVANIA_API: (process.env.AURVANIA_API || 'https://aurvania.quest').replace(/\/$/, ''),
   ADMIN_KEY: (process.env.ADMIN_KEY || '').trim(),
 };
@@ -227,6 +235,214 @@ const rewriteImg = (u) => {
   return /^https:\/\//.test(u) ? u : null;
 };
 
+/* ---------------- the collection index ----------------
+
+   Filtering has to see the WHOLE collection: a sidebar built from the 24
+   tokens that happen to be on screen would give wrong counts and hide
+   matches further down. So each collection gets walked once — ids from
+   get_tokens, traits from each token's metadata — and the result is held
+   for a while. Metadata reads are individually cached too, so refreshes
+   are cheap after the first walk.
+
+   Big collections are capped rather than allowed to stall a request; the
+   response says so instead of quietly pretending the index is complete. */
+
+const INDEX_MAX_TOKENS = parseInt(process.env.INDEX_MAX_TOKENS || '1500', 10);
+const INDEX_TTL_MS = 600000;
+const META_CONCURRENCY = 8;
+
+async function mapPool(items, size, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      try { out[i] = await fn(items[i], i); } catch (_) { out[i] = null; }
+    }
+  }));
+  return out;
+}
+
+/** Traits, flattened to strings so they can be compared and counted.
+    Numbers stay printable ("Level 3"), everything else is trimmed. */
+function traitsOf(meta) {
+  const t = {};
+  for (const a of (meta && Array.isArray(meta.attributes) ? meta.attributes : [])) {
+    const key = String(a.trait_type ?? a.name ?? '').trim();
+    if (!key) continue;
+    const val = a.value;
+    if (val === null || val === undefined || val === '') continue;
+    t[key] = String(val).trim().slice(0, 60);
+  }
+  return t;
+}
+
+async function collectionIndex(addr) {
+  return cached('index:' + addr, INDEX_TTL_MS, async () => {
+    const c = nftC(addr);
+    const ids = [];
+    let start = '';
+    let partial = false;
+    for (let page = 0; page < 200; page++) {
+      const args = { limit: 100, descending: false };
+      if (start) args.start = start;
+      let batch = [];
+      try { batch = (await c.functions.get_tokens(args)).result?.token_ids || []; }
+      catch (_) { break; }
+      ids.push(...batch);
+      if (batch.length < 100) break;
+      start = batch[batch.length - 1];
+      if (ids.length >= INDEX_MAX_TOKENS) { partial = true; break; }
+    }
+    const capped = ids.slice(0, INDEX_MAX_TOKENS);
+
+    const tokens = (await mapPool(capped, META_CONCURRENCY, async (tid) => {
+      const meta = await tokenMeta(addr, tid).catch(() => null);
+      return {
+        tokenId: tid, label: hexToLabel(tid),
+        name: meta?.name || hexToLabel(tid),
+        image: rewriteImg(meta?.image),
+        traits: traitsOf(meta),
+      };
+    })).filter(Boolean);
+
+    // Facets, ordered by how often the trait appears then alphabetically,
+    // so the sidebar leads with the traits that actually divide the set.
+    const byTrait = new Map();
+    for (const t of tokens) {
+      for (const [k, v] of Object.entries(t.traits)) {
+        if (!byTrait.has(k)) byTrait.set(k, new Map());
+        const vals = byTrait.get(k);
+        vals.set(v, (vals.get(v) || 0) + 1);
+      }
+    }
+    const facets = [...byTrait.entries()]
+      .map(([trait, vals]) => ({
+        trait,
+        total: [...vals.values()].reduce((a, b) => a + b, 0),
+        values: [...vals.entries()]
+          .map(([value, count]) => ({ value, count }))
+          .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value), undefined, { numeric: true })),
+      }))
+      .filter(f => f.values.length > 1 || f.total < tokens.length)
+      .sort((a, b) => b.values.length - a.values.length || a.trait.localeCompare(b.trait));
+
+    return { tokens, facets, total: tokens.length, partial: partial || ids.length > capped.length };
+  });
+}
+
+/* ---------------- trade history ----------------
+
+   Every listing, cancellation and sale is already recorded: the contract
+   emits an event for each, and Koinos indexes a contract's own events
+   under its address. So history is READ FROM THE CHAIN rather than kept
+   here — a trade done straight against the contract, bypassing this site
+   entirely, still shows up.
+
+   The walk is incremental. Records arrive newest-first with a sequence
+   number, so once a sequence has been seen it is never fetched again, and
+   what has been decoded is written to DATA_DIR to survive a restart.
+   Block timestamps cost two extra reads per transaction, so they are
+   resolved once and stored with the event. */
+
+const HISTORY_FILE = path.join(CFG.DATA_DIR, 'history.json');
+const EVENT_TYPES = {
+  'market.create_order': 'market.create_order_event',
+  'market.execute_order': 'market.execute_order_event',
+  'market.cancel_order': 'market.cancel_order_event',
+};
+const EVENT_KIND = {
+  'market.create_order': 'listed',
+  'market.execute_order': 'sold',
+  'market.cancel_order': 'cancelled',
+};
+/* No defaultTypeName: koilib's Serializer lets a default SILENTLY win over
+   the type passed per call, which would decode every event as whichever
+   type was named first. */
+const marketSerializer = MARKET_ABI.koilib_types ? new Serializer(MARKET_ABI.koilib_types) : null;
+
+let history = loadJson(HISTORY_FILE, null) || { events: [], lastSeq: -1 };
+/* How many account-history records the last walk actually read. Without
+   it, "no trades yet" and "the walk never reached the chain" look
+   identical from the outside — including to the tests. */
+let historyScanned = 0;
+let historyAt = 0;
+let historyRun = null;
+
+async function blockTimeOf(txId) {
+  return cached('txtime:' + txId, 86400000, async () => {
+    try {
+      const t = await provider.call('transaction_store.get_transactions_by_id', { transaction_ids: [txId] });
+      const blockId = ((t.transactions || [])[0] || {}).containing_blocks?.[0];
+      if (!blockId) return null;
+      const b = await provider.call('block_store.get_blocks_by_id', {
+        block_ids: [blockId], return_block: true, return_receipt: false,
+      });
+      const hdr = ((b.block_items || [])[0] || {}).block?.header || {};
+      return hdr.timestamp ? Number(hdr.timestamp) : null;
+    } catch (_) { return null; }
+  });
+}
+
+async function refreshHistory({ force = false } = {}) {
+  if (!marketC || !marketSerializer) return history;
+  if (!force && Date.now() - historyAt < 20000) return history;
+  if (historyRun) return historyRun;          // one walk at a time
+  historyRun = (async () => {
+    const seen = new Set(history.events.map(e => e.seq));
+    const fresh = [];
+    let seq = null;
+    let scanned = 0;
+    for (let page = 0; page < 20; page++) {
+      const args = { address: CFG.MARKET_ADDR, limit: 100, ascending: false, irreversible: false };
+      if (seq !== null) args.seq_num = seq;
+      let res;
+      try { res = await provider.call('account_history.get_account_history', args); }
+      catch (_) { break; }
+      const values = res.values || [];
+      if (!values.length) break;
+      scanned += values.length;
+      let reachedKnown = false;
+      for (const v of values) {
+        const n = Number(v.seq_num);
+        if (n <= history.lastSeq || seen.has(n)) { reachedKnown = true; continue; }
+        const txId = v.trx?.transaction?.id || null;
+        for (const ev of (v.trx?.receipt?.events || [])) {
+          const type = EVENT_TYPES[ev.name];
+          if (!type) continue;
+          let data = null;
+          try { data = await marketSerializer.deserialize(utils.decodeBase64url(ev.data), type); }
+          catch (_) { continue; }
+          fresh.push({
+            seq: n, kind: EVENT_KIND[ev.name], tx: txId,
+            at: await blockTimeOf(txId),
+            collection: data.collection, tokenId: data.token_id,
+            seller: data.seller || null, buyer: data.buyer || null,
+            price: data.price || null,
+            fee: data.protocol_fee || null, royalty: data.royalties_paid || null,
+            expires: data.expires || null,
+          });
+        }
+      }
+      const oldest = Number(values[values.length - 1].seq_num);
+      if (reachedKnown || oldest <= 0) break;
+      seq = oldest - 1;
+      if (seq < 0) break;
+    }
+    if (fresh.length) {
+      history.events = [...fresh, ...history.events]
+        .sort((a, b) => b.seq - a.seq)
+        .slice(0, 20000);
+      history.lastSeq = Math.max(history.lastSeq, ...fresh.map(e => e.seq));
+      try { saveJson(HISTORY_FILE, history); } catch (_) {}
+    }
+    historyScanned = scanned;
+    historyAt = Date.now();
+    return history;
+  })().finally(() => { historyRun = null; });
+  return historyRun;
+}
+
 /* ---------------- mana sponsorship ---------------- */
 
 /* The rules that keep the dev wallet safe while it pays for strangers:
@@ -272,7 +488,12 @@ async function sponsor(txJson, ip) {
   if (!h.payee || h.payee === devAddr) return { status: 400, body: { error: 'payee must be the acting account' } };
   let rc;
   try { rc = BigInt(h.rc_limit); } catch (_) { return { status: 400, body: { error: 'bad rc_limit' } }; }
-  if (rc <= 0n || rc > CFG.SPONSOR_RC_MAX) {
+  /* Budget the ceiling against the work actually being authorized, so a
+     bigger transaction gets the mana it needs without handing every
+     transaction the maximum. */
+  const opBudget = CFG.SPONSOR_RC_PER_OP * BigInt(tx.operations.length);
+  const ceiling = opBudget < CFG.SPONSOR_RC_MAX ? opBudget : CFG.SPONSOR_RC_MAX;
+  if (rc <= 0n || rc > ceiling) {
     return { status: 400, body: { error: 'rc_limit above the sponsorship ceiling' } };
   }
 
@@ -305,7 +526,11 @@ async function sponsor(txJson, ip) {
     const receipt = await provider.sendTransaction(tx);
     return { status: 200, body: { ok: true, id: tx.id, receipt: receipt && receipt.receipt } };
   } catch (e) {
-    return { status: 400, body: { error: String(e && e.message || e).slice(0, 300) } };
+    /* Keep the chain's own words in the log — that is where a rejection
+       gets diagnosed — while the caller gets something a person can act on. */
+    const raw = String(e && e.message || e);
+    console.error('[sponsor] rejected', raw.slice(0, 300));
+    return { status: 400, body: { error: raw.slice(0, 300) } };
   }
 }
 
@@ -416,32 +641,102 @@ const api = {
     json(res, 200, { registered: !!reg, meta: reg, info, orders });
   },
 
+  /** The browse grid, filtered and sorted across the WHOLE collection.
+      Filters arrive as repeated t=Trait:Value; several values of the SAME
+      trait are an OR (rare or epic), different traits are an AND. */
   async tokens(req, res, addr, q) {
     if (!isAddr(addr)) return json(res, 400, { error: 'bad address' });
-    const start = String(q.get('start') || '');
-    const limit = Math.min(48, Math.max(1, parseInt(q.get('limit') || '24', 10)));
-    const c = nftC(addr);
-    let rows = [];
-    try {
-      const args = { limit, descending: false };
-      if (start) args.start = start;
-      const { result } = await cached(`tokens:${addr}:${start}:${limit}`, 30000,
-        async () => c.functions.get_tokens(args));
-      rows = result?.token_ids || [];
-    } catch (_) {}
+    const offset = Math.max(0, parseInt(q.get('offset') || '0', 10));
+    const limit = Math.min(60, Math.max(1, parseInt(q.get('limit') || '24', 10)));
+    const status = String(q.get('status') || 'all');
+    const sort = String(q.get('sort') || 'default');
+    const search = String(q.get('q') || '').trim().toLowerCase();
+
+    const wanted = new Map();
+    for (const raw of q.getAll('t')) {
+      const i = String(raw).indexOf(':');
+      if (i < 1) continue;
+      const trait = raw.slice(0, i), value = raw.slice(i + 1);
+      if (!wanted.has(trait)) wanted.set(trait, new Set());
+      wanted.get(trait).add(value);
+    }
+
+    const idx = await collectionIndex(addr);
     const orders = await collectionOrders(addr).catch(() => []);
     const listed = new Map(orders.map(o => [o.tokenId, o]));
-    const out = [];
-    for (const tid of rows) {
-      const meta = await tokenMeta(addr, tid).catch(() => null);
-      out.push({
-        tokenId: tid, label: hexToLabel(tid),
-        name: meta?.name || hexToLabel(tid),
-        image: rewriteImg(meta?.image),
-        order: listed.get(tid) || null,
-      });
+
+    /* "Mine" is just another filter, so it composes with the traits
+       instead of being a separate view with its own half of the rules. */
+    const owner = String(q.get('owner') || '');
+    let ownedIds = null;
+    if (isAddr(owner)) {
+      try {
+        const { result } = await cached(`owned:${addr}:${owner}`, 20000,
+          async () => nftC(addr).functions.get_tokens_by_owner({ owner, limit: 500 }));
+        ownedIds = new Set(result?.token_ids || []);
+      } catch (_) { ownedIds = new Set(); }
     }
-    json(res, 200, { tokens: out, nextStart: rows.length === limit ? rows[rows.length - 1] : null });
+
+    let rows = idx.tokens.filter((t) => {
+      for (const [trait, values] of wanted) {
+        if (!values.has(t.traits[trait])) return false;
+      }
+      if (ownedIds && !ownedIds.has(t.tokenId)) return false;
+      if (status === 'listed' && !listed.has(t.tokenId)) return false;
+      if (status === 'unlisted' && listed.has(t.tokenId)) return false;
+      if (search && !(`${t.name} ${t.label}`.toLowerCase().includes(search))) return false;
+      return true;
+    }).map(t => ({ ...t, order: listed.get(t.tokenId) || null }));
+
+    const priceOf = (t) => (t.order ? BigInt(t.order.price) : null);
+    if (sort === 'price_asc' || sort === 'price_desc') {
+      rows.sort((a, b) => {
+        const pa = priceOf(a), pb = priceOf(b);
+        // Unlisted tokens have no price; they sort after everything priced.
+        if (pa === null && pb === null) return 0;
+        if (pa === null) return 1;
+        if (pb === null) return -1;
+        if (pa === pb) return 0;
+        const cmp = pa < pb ? -1 : 1;
+        return sort === 'price_asc' ? cmp : -cmp;
+      });
+    } else if (sort === 'name') {
+      rows.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true }));
+    }
+
+    json(res, 200, {
+      tokens: rows.slice(offset, offset + limit).map(t => ({
+        tokenId: t.tokenId, label: t.label, name: t.name, image: t.image, order: t.order,
+      })),
+      matched: rows.length,
+      indexed: idx.total,
+      partial: idx.partial,
+      nextOffset: offset + limit < rows.length ? offset + limit : null,
+    });
+  },
+
+  /** The sidebar: every trait in the collection with real counts. */
+  async facets(req, res, addr) {
+    if (!isAddr(addr)) return json(res, 400, { error: 'bad address' });
+    const idx = await collectionIndex(addr);
+    const orders = await collectionOrders(addr).catch(() => []);
+    json(res, 200, {
+      facets: idx.facets, indexed: idx.total, partial: idx.partial, listed: orders.length,
+    });
+  },
+
+  /** What has happened to a token: listed, cancelled, sold — from chain
+      events, so trades made outside this site are included. */
+  async history(req, res, q) {
+    const addr = String(q.get('collection') || '');
+    const tokenId = String(q.get('token_id') || '');
+    if (!isAddr(addr)) return json(res, 400, { error: 'bad address' });
+    const h = await refreshHistory().catch(() => history);
+    const rows = h.events
+      .filter(e => e.collection === addr && (!tokenId || e.tokenId === tokenId))
+      .sort((a, b) => (b.at || 0) - (a.at || 0) || b.seq - a.seq)
+      .slice(0, 100);
+    json(res, 200, { events: rows, scanned: historyScanned, known: h.events.length });
   },
 
   async token(req, res, addr, tokenId) {
@@ -559,11 +854,13 @@ const server = http.createServer(async (req, res) => {
     let m;
     if ((m = /^\/api\/collections\/([1-9A-HJ-NP-Za-km-z]+)$/.exec(p))) return await api.collection(req, res, m[1]);
     if ((m = /^\/api\/collections\/([1-9A-HJ-NP-Za-km-z]+)\/tokens$/.exec(p))) return await api.tokens(req, res, m[1], url.searchParams);
+    if ((m = /^\/api\/collections\/([1-9A-HJ-NP-Za-km-z]+)\/facets$/.exec(p))) return await api.facets(req, res, m[1]);
     if ((m = /^\/api\/collections\/([1-9A-HJ-NP-Za-km-z]+)\/token\/([0-9a-fx]+)$/i.exec(p))) return await api.token(req, res, m[1], m[2]);
     if (p === '/api/owned') return await api.owned(req, res, url.searchParams);
     if (p === '/api/account') return await api.account(req, res);
     if (p === '/api/sponsor') return await api.sponsor(req, res);
     if (p === '/api/balance') return await api.balance(req, res, url.searchParams);
+    if (p === '/api/history') return await api.history(req, res, url.searchParams);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });
     return serveStatic(res, p === '/' ? '/index.html' : p);
   } catch (e) {
@@ -579,4 +876,9 @@ server.listen(CFG.PORT, () => {
   console.log(`   sponsor: ${dev ? `on — payer ${dev.getAddress()}` : 'OFF (KOINOS_DEV_WIF not set)'}`);
   console.log(`   sign-in: bridged to ${CFG.AURVANIA_API}`);
   console.log(`   registry: ${registry.collections.length} collection(s) · admin ${CFG.ADMIN_KEY ? 'enabled' : 'OFF'}`);
+  console.log(`   history: ${history.events.length} known event(s)`);
+  // Warm the trade history so the first visitor does not pay for the walk.
+  refreshHistory({ force: true })
+    .then((h) => { if (h.events.length) console.log(`   history: indexed to ${h.events.length} event(s)`); })
+    .catch(() => {});
 });

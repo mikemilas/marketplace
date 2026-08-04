@@ -55,6 +55,9 @@ main { flex: 1; width: min(1180px, 100%); margin: 0 auto; padding: 22px 20px 60p
   padding: 10px 16px; transition: border-color .12s, transform .06s, background .12s;
 }
 .btn:hover { border-color: var(--accent); }
+/* Links that are buttons: an inline <a> ignores vertical padding, so it
+   has to become a box before it looks like the buttons beside it. */
+a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .btn:active { transform: translateY(1px); }
 .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .btn.primary:hover { filter: brightness(1.08); }
@@ -131,8 +134,8 @@ label { display: block; font-size: 13px; color: var(--dim); margin: 12px 0 5px; 
 .t-art img { width: 100%; display: block; image-rendering: pixelated; }
 .t-art .ph { aspect-ratio: 1; display: grid; place-items: center; font-size: 54px; opacity: .3; }
 .t-info h2 { font-size: 26px; }
-.t-info .crumb { font-size: 13px; color: var(--dim); margin-bottom: 6px; display: block; }
-.t-info .crumb:hover { color: var(--accent); }
+.crumb { font-size: 13px; color: var(--dim); margin-bottom: 6px; display: block; }
+.crumb:hover { color: var(--accent); }
 .kv { display: flex; gap: 8px; font-size: 14px; margin-top: 6px; color: var(--dim); flex-wrap: wrap; }
 .kv .mono { color: var(--text); word-break: break-all; }
 .deal {
@@ -146,6 +149,112 @@ label { display: block; font-size: 13px; color: var(--dim); margin: 12px 0 5px; 
 .attr { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
 .attr span { display: block; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
 .attr b { font-size: 14px; }
+
+/* ---------- collection filters ---------- */
+.c-layout { display: grid; grid-template-columns: 232px 1fr; gap: 22px; align-items: start; margin-top: 18px; }
+.c-side {
+  position: sticky; top: 74px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px; max-height: calc(100dvh - 100px); overflow-y: auto;
+}
+.side-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.side-head b { font-size: 13px; letter-spacing: 2px; text-transform: uppercase; color: var(--dim); }
+.side-head .linkish { margin-left: auto; font-size: 12px; }
+.side-x { display: none; background: none; border: none; color: var(--dim); cursor: pointer; font-size: 16px; }
+.facet { border-top: 1px solid var(--border); padding: 12px 0 4px; }
+.facet:first-of-type { border-top: none; }
+.facet.dim { color: var(--dim); font-size: 12px; }
+.facet-h { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); margin-bottom: 6px; }
+.facet-vals.scrolly { max-height: 208px; overflow-y: auto; }
+.fopt {
+  display: flex; align-items: center; gap: 8px; margin: 0; padding: 5px 4px;
+  border-radius: 6px; cursor: pointer; font-size: 13.5px; color: var(--text);
+}
+.fopt:hover { background: var(--panel); }
+.fopt.dim span { color: var(--dim); }
+.fopt input { width: auto; margin: 0; accent-color: var(--accent); flex: none; }
+.fopt span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: capitalize; }
+.fopt em { font-style: normal; font-size: 11.5px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.c-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+.c-toolbar input[type="search"] { width: auto; flex: 1; min-width: 140px; }
+.c-toolbar select { width: auto; }
+.c-count { color: var(--dim); font-size: 13px; font-variant-numeric: tabular-nums; margin-left: auto; }
+.filt-toggle { display: none; }
+.load-more { margin-top: 14px; }
+@media (max-width: 860px) {
+  .c-layout { grid-template-columns: 1fr; }
+  .filt-toggle { display: inline-flex; }
+  .side-x { display: block; margin-left: auto; }
+  .side-head .linkish { margin-left: 0; }
+  /* Off-canvas on small screens: the filters are a drawer, not a column. */
+  .c-side {
+    position: fixed; inset: 0 auto 0 0; z-index: 60; width: min(300px, 86vw);
+    border-radius: 0; max-height: none; transform: translateX(-102%);
+    transition: transform .18s ease; box-shadow: 0 0 40px rgba(0, 0, 0, .5);
+  }
+  .c-side.open { transform: none; }
+  /* A backdrop, so the page behind is visibly out of play and tapping it
+     closes the drawer — the gesture everyone tries first. */
+  .c-layout::before {
+    content: ''; position: fixed; inset: 0; z-index: 55;
+    background: rgba(4, 6, 10, .66); opacity: 0; pointer-events: none;
+    transition: opacity .18s ease;
+  }
+  .c-layout.filters-open::before { opacity: 1; pointer-events: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .c-side, .c-layout::before { transition: none; }
+}
+
+/* ---------- listing page ---------- */
+.list-wrap { display: grid; grid-template-columns: 1fr minmax(300px, 380px); gap: 26px; align-items: start; margin-top: 10px; }
+@media (max-width: 860px) { .list-wrap { grid-template-columns: 1fr; } }
+.list-item { display: grid; grid-template-columns: minmax(120px, 200px) 1fr; gap: 20px; align-items: start; }
+/* Hold the square even while the art is loading, or if it never arrives —
+   otherwise the panel jumps once the image lands. */
+.list-item .t-art { aspect-ratio: 1; display: grid; place-items: center; }
+.list-item .t-art img { width: 100%; height: 100%; object-fit: contain; }
+@media (max-width: 520px) { .list-item { grid-template-columns: 1fr; } }
+.list-item h2 { font-size: 22px; }
+.list-panel { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+.list-panel h3 { font-size: 17px; }
+.list-panel .btn { width: 100%; justify-content: center; }
+.list-panel .fee-note { font-size: 12.5px; color: var(--dim); margin-top: 10px; }
+.price-field { display: flex; align-items: center; gap: 8px; }
+.price-field input { font-size: 20px; font-family: var(--mono); font-weight: 700; }
+.price-field span { color: var(--dim); font-weight: 600; font-size: 14px; }
+.breakdown { margin: 16px 0; border-top: 1px solid var(--border); }
+.brow { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; font-size: 13.5px; color: var(--dim); border-bottom: 1px solid var(--border); }
+.brow b { color: var(--text); font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 600; }
+.brow.minus b { color: var(--bad); }
+.brow.total { border-bottom: none; padding-top: 12px; font-size: 15px; color: var(--text); font-weight: 600; }
+.brow.total b { color: var(--accent); font-size: 17px; font-weight: 800; }
+
+/* ---------- trade history ---------- */
+.hist { margin-top: 22px; border-top: 1px solid var(--border); padding-top: 14px; }
+.hist-h { font-size: 13px; letter-spacing: 2px; text-transform: uppercase; color: var(--dim); margin-bottom: 8px; }
+.hist .fee-note { font-size: 13px; color: var(--dim); }
+.hist-row {
+  display: grid; grid-template-columns: 84px 1fr auto auto; gap: 12px; align-items: center;
+  padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13.5px;
+}
+.hist-row:last-child { border-bottom: none; }
+.hist-tag {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700;
+  padding: 3px 8px; border-radius: 999px; text-align: center;
+  background: var(--panel); border: 1px solid var(--border); color: var(--dim);
+}
+.hist-row.sold .hist-tag { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
+.hist-row.listed .hist-tag { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.hist-what { color: var(--dim); overflow: hidden; }
+.hist-what em { font-style: normal; display: block; font-size: 12px; opacity: .8; }
+.hist-amt { font-family: var(--mono); font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.hist-when { color: var(--dim); font-size: 12px; white-space: nowrap; }
+.hist-tx { color: var(--dim); margin-left: 6px; text-decoration: none; }
+.hist-tx:hover { color: var(--accent); }
+@media (max-width: 620px) {
+  .hist-row { grid-template-columns: 76px 1fr auto; }
+  .hist-when { grid-column: 2 / -1; }
+}
 
 /* ---------- modal / toasts ---------- */
 .modal-back {

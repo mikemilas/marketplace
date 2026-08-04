@@ -70,7 +70,9 @@ MARKET_ADDR=<deployed address> KOINOS_DEV_WIF=<dev wif> node server.js
 | `KOINOS_NETWORK` | `mainnet` (default) or `harbinger` |
 | `MARKET_ADDR` | the deployed marketplace contract |
 | `KOINOS_DEV_WIF` | the mana payer — sponsorship is off without it |
-| `SPONSOR_RC_MAX` | per-transaction mana ceiling in satoshis (default 5 KOIN) |
+| `SPONSOR_RC_PER_OP` | mana ceiling **per operation** in satoshis (default 3 KOIN) |
+| `SPONSOR_RC_MAX` | absolute per-transaction mana ceiling (default 15 KOIN) |
+| `INDEX_MAX_TOKENS` | how deep a collection is indexed for filters (default 1500) |
 | `AURVANIA_API` | sign-in bridge target (default `https://aurvania.quest`) |
 | `ADMIN_KEY` | enables `POST /api/collections` to register collections |
 | `DATA_DIR` | runtime state (registry), default `./data-live` |
@@ -95,10 +97,44 @@ co-signs and broadcasts. What keeps the dev wallet safe:
    also enforces this — the payee's nonce is consumed);
 3. every operation must target the marketplace contract, or be an
    `approve`/`set_approval_for_all` on a **registered** collection;
-4. rc is capped per transaction, and each payee and IP is rate-limited.
+4. rc is capped **per operation** with an absolute ceiling, and each payee
+   and IP is rate-limited.
+
+A note on that ceiling, because it bit us: a real Koinos contract call burns
+roughly 0.4–1.3 KOIN of mana, so a two-operation listing (`approve` +
+`create_order`) needs well over 2 KOIN. An earlier flat 2 KOIN budget was
+under what the transaction actually cost, and the chain rejected listings
+with `insufficient rc` — which reads like the dev wallet is broke when it is
+not. `rc_limit` is a ceiling, not a charge: only `rc_used` ever leaves the
+payer, so budgeting generously is free.
 
 Kondor users additionally fall back to a self-paid transaction if the
 sponsor is ever down.
+
+### Filters, and why they are server-side
+
+A sidebar built from the tokens currently on screen would show wrong counts
+and hide matches further down the collection. So the server walks a
+collection once — ids from `get_tokens`, traits from each token's metadata —
+and holds the index for ten minutes:
+
+* `GET /api/collections/:addr/facets` — every trait with real counts.
+* `GET /api/collections/:addr/tokens?t=Rarity:rare&t=Kind:pet&status=listed&sort=price_asc&q=blade&owner=1…`
+  — repeated `t=Trait:Value`; several values of the **same** trait are an OR,
+  different traits are an AND. Paging is `offset`/`limit`.
+
+Collections larger than `INDEX_MAX_TOKENS` are indexed to that depth and the
+response says `partial: true` rather than pretending to be complete.
+
+### Trade history
+
+Every listing, cancellation and sale is already on chain: the contract emits
+`market.create_order` / `execute_order` / `cancel_order`, and Koinos indexes a
+contract's own events under its address. `GET /api/history?collection=&token_id=`
+serves them, so a trade made straight against the contract — bypassing this
+site — still shows up. The walk is incremental (records carry a sequence
+number) and is written to `DATA_DIR/history.json` so a restart does not
+re-read the chain.
 
 ### Adding collections
 

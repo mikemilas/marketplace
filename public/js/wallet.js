@@ -112,9 +112,45 @@ const Wallet = (() => {
     return c.encodeOperation({ name, args });
   }
 
+  /* Mana budget. Measured on mainnet, a single Koinos contract call burns
+     roughly 0.4–1.3 KOIN of mana, so a two-operation listing (approve +
+     create_order) needs well over the flat 2 KOIN this used to ask for —
+     which is exactly why listings came back "insufficient rc". rc_limit is
+     a CEILING, not a charge: only what the transaction actually burns
+     leaves the payer, so budgeting generously costs nothing, and the
+     server caps it per operation anyway. */
+  const RC_PER_OP = 300000000n;    // 3 KOIN of headroom for each operation
+  const RC_CEILING = 1500000000n;  // never ask for more than 15 KOIN
+  const rcFor = (opCount) => {
+    const want = RC_PER_OP * BigInt(Math.max(1, opCount));
+    return (want > RC_CEILING ? RC_CEILING : want).toString();
+  };
+
+  /** Chain errors arrive as raw JSON — {"error":"insufficient rc",…}.
+      Nobody should ever have to read one of those. */
+  function humanError(raw) {
+    let msg = String(raw && raw.message ? raw.message : raw || 'Transaction failed');
+    for (let i = 0; i < 3; i++) {
+      try {
+        const j = JSON.parse(msg);
+        if (j && typeof j.error === 'string') { msg = j.error; continue; }
+      } catch (_) {}
+      break;
+    }
+    msg = msg.replace(/^transaction reverted:\s*/i, '').trim();
+    if (/insufficient rc|rc limit/i.test(msg)) {
+      return 'This transaction needed more mana than the ceiling allowed. Mana is on us, so this is ours to fix — please try again, and tell us if it repeats.';
+    }
+    if (/nonce/i.test(msg)) return 'Your account had another transaction in flight. Give it a few seconds and try again.';
+    if (/insufficient balance|has no balance/i.test(msg)) return 'Not enough KOIN in your wallet for this purchase.';
+    if (/not authorized|authoriz/i.test(msg)) return 'The chain refused that — this wallet is not allowed to perform it.';
+    if (/order (does not exist|not found)/i.test(msg)) return 'That listing is gone — it was just bought or cancelled.';
+    return msg.slice(0, 200);
+  }
+
   /** Build, sign and submit a transaction of marketplace operations.
       Sponsored by default; self-paid through Kondor as the fallback. */
-  async function send(ops, { rcLimit = '200000000' } = {}) {
+  async function send(ops, { rcLimit = rcFor(ops.length) } = {}) {
     if (!account) throw new Error('Connect a wallet first');
 
     if (cfg.sponsor && cfg.sponsorPayer) {
@@ -135,7 +171,7 @@ const Wallet = (() => {
       // A sponsorship outage must not strand Kondor users, who can pay
       // their own mana. Hosted accounts have no mana, so for them the
       // sponsor error is the real answer.
-      if (account.kind !== 'kondor') throw new Error(data.error || 'The sponsor declined this transaction');
+      if (account.kind !== 'kondor') throw new Error(humanError(data.error || 'The sponsor declined this transaction'));
     }
 
     const tx = new Transaction({
@@ -144,7 +180,8 @@ const Wallet = (() => {
     for (const op of ops) await tx.pushOperation(op);
     await tx.prepare();
     await tx.sign();
-    await tx.send();
+    try { await tx.send(); }
+    catch (e) { throw new Error(humanError(e)); }
     return { id: tx.transaction.id, sponsored: false };
   }
 
