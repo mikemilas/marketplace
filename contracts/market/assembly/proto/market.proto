@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package market;
+
+import "koinos/options.proto";
+
+// One marketplace for every KCS-2 collection on Koinos. Modeled on the
+// open-source Kollection contract (MIT, kollection-nft/marketplace): orders
+// are approval-based — the NFT never leaves the seller's wallet until the
+// moment it sells — and payment is KOIN, split buyer -> treasury (platform
+// fee) -> royalty recipients -> seller in one atomic transaction.
+
+message config {
+   bytes treasury = 1 [(koinos.btype) = ADDRESS];
+   bytes koin = 2 [(koinos.btype) = ADDRESS];
+   // Platform fee in basis points of 10000. 250 = 2.5%.
+   uint32 fee_bps = 3;
+}
+
+message order {
+   bytes seller = 1 [(koinos.btype) = ADDRESS];
+   bytes collection = 2 [(koinos.btype) = ADDRESS];
+   bytes token_id = 3 [(koinos.btype) = HEX];
+   uint64 price = 4 [jstype = JS_STRING];
+   // Unix ms after which the order is dead. 0 = never expires.
+   uint64 expires = 5 [jstype = JS_STRING];
+   uint64 created = 6 [jstype = JS_STRING];
+}
+
+message order_key {
+   bytes collection = 1 [(koinos.btype) = ADDRESS];
+   bytes token_id = 2 [(koinos.btype) = HEX];
+}
+
+message create_order_args {
+   bytes collection = 1 [(koinos.btype) = ADDRESS];
+   bytes token_id = 2 [(koinos.btype) = HEX];
+   uint64 price = 3 [jstype = JS_STRING];
+   uint64 expires = 4 [jstype = JS_STRING];
+}
+
+message execute_order_args {
+   bytes collection = 1 [(koinos.btype) = ADDRESS];
+   bytes token_id = 2 [(koinos.btype) = HEX];
+   bytes buyer = 3 [(koinos.btype) = ADDRESS];
+   // The buyer agrees to THIS price. Without it a seller could front-run a
+   // buy by re-listing at a higher price the buyer never saw.
+   uint64 max_price = 4 [jstype = JS_STRING];
+}
+
+message get_orders_args {
+   // Empty = walk every order on the market; set = only this collection.
+   bytes collection = 1 [(koinos.btype) = ADDRESS];
+   // Resume after this token id (exclusive). Empty = from the start.
+   bytes start_after = 2 [(koinos.btype) = HEX];
+   uint32 limit = 3;
+}
+
+message order_list {
+   repeated order value = 1;
+}
+
+message create_order_event {
+   bytes seller = 1 [(koinos.btype) = ADDRESS];
+   bytes collection = 2 [(koinos.btype) = ADDRESS];
+   bytes token_id = 3 [(koinos.btype) = HEX];
+   uint64 price = 4 [jstype = JS_STRING];
+   uint64 expires = 5 [jstype = JS_STRING];
+}
+
+message execute_order_event {
+   bytes buyer = 1 [(koinos.btype) = ADDRESS];
+   bytes seller = 2 [(koinos.btype) = ADDRESS];
+   bytes collection = 3 [(koinos.btype) = ADDRESS];
+   bytes token_id = 4 [(koinos.btype) = HEX];
+   uint64 price = 5 [jstype = JS_STRING];
+   uint64 protocol_fee = 6 [jstype = JS_STRING];
+   uint64 royalties_paid = 7 [jstype = JS_STRING];
+}
+
+message cancel_order_event {
+   bytes seller = 1 [(koinos.btype) = ADDRESS];
+   bytes collection = 2 [(koinos.btype) = ADDRESS];
+   bytes token_id = 3 [(koinos.btype) = HEX];
+}

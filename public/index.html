@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bazaar — the Koinos NFT marketplace</title>
+<meta name="description" content="Buy and sell NFTs from every Koinos collection, in KOIN, with zero mana fees — the marketplace pays them for you. 2.5% platform fee, collection royalties honored.">
+<meta name="theme-color" content="#0b0d12">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/style.css?v=1">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="#/">
+    <img src="assets/mark.svg" alt="" width="26" height="26">
+    <span>BAZAAR</span>
+    <span class="brand-sub">Koinos NFTs</span>
+  </a>
+  <div class="top-actions">
+    <span id="net-chip" class="chip dim-chip"></span>
+    <button id="btn-me" class="btn ghost hidden">My items</button>
+    <button id="btn-connect" class="btn primary">Connect</button>
+  </div>
+</header>
+
+<main id="view"><div class="loading">Loading…</div></main>
+
+<footer class="foot">
+  <span>2.5% platform fee · collection royalties honored · mana on us</span>
+  <span id="foot-market" class="mono"></span>
+</footer>
+
+<!-- connect modal -->
+<div id="modal-back" class="modal-back hidden">
+  <div class="modal" id="modal"></div>
+</div>
+<div id="toasts"></div>
+
+<script src="js/vendor/koilib.min.js"></script>
+<script src="js/vendor/kondor.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async></script>
+<script src="js/wallet.js?v=1"></script>
+<script src="js/app.js?v=1"></script>
+</body>
+</html>

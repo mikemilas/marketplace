@@ -1,0 +1,27 @@
+{
+  "targets": {
+    "testnet": {
+      "outFile": "./build/testnet/contract.wasm",
+      "optimizeLevel": 3,
+      "shrinkLevel": 0,
+      "use": [
+        "BUILD_FOR_TESTING=1"
+      ]
+    },
+    "release": {
+      "outFile": "./build/release/contract.wasm",
+      "optimizeLevel": 3,
+      "shrinkLevel": 0,
+      "use": [
+        "BUILD_FOR_TESTING=0"
+      ]
+    }
+  },
+  "options": {
+    "exportStart": "_start",
+    "disable": [
+      "sign-extension",
+      "bulk-memory"
+    ]
+  }
+}
