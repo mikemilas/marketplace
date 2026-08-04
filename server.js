@@ -35,6 +35,7 @@
    ============================================================ */
 'use strict';
 const http = require('http');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { Signer, Provider, Contract, Transaction, Serializer, utils } = require('koilib');
@@ -106,6 +107,17 @@ const CFG = {
      logs; override it if the rule ever changes. */
   BRIDGE_UA: (process.env.BRIDGE_UA || 'curl/8.5.0 (OURO-marketplace; +https://ouro.lifestyle)').trim(),
   ADMIN_KEY: (process.env.ADMIN_KEY || '').trim(),
+
+  /* Launching a collection uploads a contract, and an upload costs about
+     59 KOIN of mana against roughly 1 for an ordinary call — measured on
+     this very marketplace's own deployment. Around 28 of them would take
+     the sponsor wallet to zero and freeze listings and purchases for
+     everyone until it recharges, so a launch is paid for AND rationed.
+     Set LAUNCH_FEE_KOIN=0 to make launching free; the limits still apply. */
+  LAUNCH_FEE_KOIN: Math.max(0, Number(process.env.LAUNCH_FEE_KOIN ?? 100)),
+  LAUNCH_PER_DAY_PER_ACCOUNT: parseInt(process.env.LAUNCH_PER_DAY_PER_ACCOUNT || '3', 10),
+  LAUNCH_PER_DAY_TOTAL: parseInt(process.env.LAUNCH_PER_DAY_TOTAL || '12', 10),
+  UPLOAD_MAX_BYTES: parseInt(process.env.UPLOAD_MAX_BYTES || String(4 * 1024 * 1024), 10),
 };
 const NET = NETWORKS[CFG.NETWORK] || NETWORKS.mainnet;
 const RPCS = (process.env.KOINOS_RPC || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -146,6 +158,11 @@ function sanitizeAbi(abi) {
   return abi;
 }
 const NFT_ABI = sanitizeAbi(loadJson(path.join(__dirname, 'server-abi', 'nft-abi.json'), {}));
+/* koilib ships a token ABI that protobufjs refuses to load — the same
+   btype extension every other ABI here has to have stripped. Constructing
+   it threw inside a catch, so KOIN balances quietly read zero for
+   everyone. Sanitize a copy once and use that. */
+const TOKEN_ABI = sanitizeAbi(JSON.parse(JSON.stringify(utils.tokenAbi)));
 const MARKET_ABI = sanitizeAbi(loadJson(path.join(__dirname, 'server-abi', 'market-abi.json'), {}));
 
 const marketC = CFG.MARKET_ADDR
@@ -529,6 +546,121 @@ async function refreshHistory({ force = false } = {}) {
   return historyRun;
 }
 
+/* ---------------- launching a collection ----------------
+
+   A launch is three things happening in order:
+
+     1. the creator pays the launch fee and the contract is uploaded, in
+        ONE transaction so the fee cannot land without the collection;
+     2. the collection is initialized — named, given its royalty, and
+        handed to the creator, who owns it from that moment;
+     3. it is registered here so it appears on the site.
+
+   The contract is deployed to its own fresh account. That account's key
+   is the collection's upgrade authority and OURO keeps it: creators own
+   their collections (mint, metadata, royalties) without having to keep a
+   key alive that would break their collection if they lost it. The key is
+   written with owner-only permissions, is never returned by any endpoint,
+   and never reaches a log line. */
+
+const pendingLaunches = new Map();      // prepared-but-unsigned launches
+const UPLOAD_DIR = path.join(CFG.DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const clientIp = (req) =>
+  String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+
+const publicOrigin = (req) => {
+  const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  const host = String(req.headers.host || '').trim();
+  return process.env.PUBLIC_ORIGIN || (host ? `${proto}://${host}` : '');
+};
+
+/** Only links we would be willing to render; never a javascript: or data: url. */
+const safeImage = (u) => {
+  const s = String(u || '').trim();
+  if (!s) return null;
+  if (s.startsWith('/u/')) return s;                        // our own upload
+  if (/^https:\/\//.test(s) || /^ipfs:\/\//.test(s)) return s.slice(0, 500);
+  return null;
+};
+
+/** Magic bytes, not the filename: the extension is whatever a caller typed. */
+function imageKind(b) {
+  if (b.length < 12) return null;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'png';
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'jpg';
+  if (b.slice(0, 6).toString('latin1') === 'GIF89a' || b.slice(0, 6).toString('latin1') === 'GIF87a') return 'gif';
+  if (b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'WEBP') return 'webp';
+  return null;
+}
+
+function readRaw(req, max) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) { req.destroy(); return resolve(null); }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', () => resolve(null));
+  });
+}
+
+const marketCfg = async () => {
+  if (!marketC) return {};
+  try { return await cached('marketcfg', 300000, async () => (await marketC.functions.get_config({})).result) || {}; }
+  catch (_) { return {}; }
+};
+
+const COLLECTION_WASM = path.join(__dirname, 'contracts', 'prebuilt', 'collection', 'contract.wasm');
+const COLLECTION_ABI = sanitizeAbi(loadJson(path.join(__dirname, 'server-abi', 'collection-abi.json'), {}));
+const KEYS_FILE = path.join(CFG.DATA_DIR, 'collection-keys.json');
+const LAUNCH_LOG = path.join(CFG.DATA_DIR, 'launches.json');
+let launches = loadJson(LAUNCH_LOG, null) || { items: [] };
+
+/** Upgrade keys, at rest. Written 0600 and read by nothing but this. */
+function rememberCollectionKey(address, wif, owner) {
+  let keys = {};
+  try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (_) {}
+  keys[address] = { wif, owner, at: Date.now() };
+  const tmp = `${KEYS_FILE}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(keys, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, KEYS_FILE);
+  try { fs.chmodSync(KEYS_FILE, 0o600); } catch (_) {}
+}
+
+const DAY = 86400000;
+function launchesSince(ms, who) {
+  const t = Date.now();
+  return launches.items.filter(l => t - l.at < ms && (!who || l.owner === who)).length;
+}
+
+const KOIN_SATS = (koin) => BigInt(Math.round(Number(koin) * 1e8));
+
+/** Everything a launch needs checked before any mana is spent on it. */
+function validateLaunch(body) {
+  const name = String(body.name || '').trim();
+  const symbol = String(body.symbol || '').trim().toUpperCase();
+  const description = String(body.description || '').trim();
+  const image = String(body.image || '').trim();
+  const uri = String(body.uri || '').trim();
+  const owner = String(body.owner || '').trim();
+  const royaltyBps = Math.round(Number(body.royaltyBps || 0));
+
+  if (!isAddr(owner)) return { error: 'A connected wallet is required to own the collection' };
+  if (name.length < 1 || name.length > 64) return { error: 'Name must be 1-64 characters' };
+  if (!/^[A-Z0-9]{1,16}$/.test(symbol)) return { error: 'Symbol must be 1-16 letters or digits' };
+  if (description.length > 1000) return { error: 'Description must be 1000 characters or fewer' };
+  if (uri && !/^https:\/\/|^ipfs:\/\//.test(uri)) return { error: 'Base URI must be https:// or ipfs://' };
+  if (uri.length > 300) return { error: 'Base URI must be 300 characters or fewer' };
+  if (image && !/^https:\/\/|^ipfs:\/\//.test(image)) return { error: 'Image must be an https:// or ipfs:// link' };
+  if (!(royaltyBps >= 0 && royaltyBps <= 1000)) return { error: 'Royalty must be between 0% and 10%' };
+  return { name, symbol, description, image, uri, owner, royaltyBps };
+}
+
 /* ---------------- mana sponsorship ---------------- */
 
 /* The rules that keep the dev wallet safe while it pays for strangers:
@@ -551,6 +683,14 @@ const entryIds = (abi) => {
 };
 const NFT_ENTRIES = entryIds(loadJson(path.join(__dirname, 'server-abi', 'nft-abi.json'), {}));
 const APPROVAL_ENTRIES = new Set([NFT_ENTRIES.approve, NFT_ENTRIES.set_approval_for_all].filter(Boolean));
+/* What a creator does to their own collection. Paying the mana for these
+   is safe because the COLLECTION decides who may run them — the contract
+   checks the caller is its owner — so this only ever funds work the chain
+   was going to accept anyway. */
+const CREATOR_ENTRIES = new Set([
+  NFT_ENTRIES.mint, NFT_ENTRIES.set_metadata,
+  NFT_ENTRIES.set_royalties, NFT_ENTRIES.transfer_ownership,
+].filter(Boolean));
 
 const sponsorHits = new Map();
 function rateLimited(key, max, windowMs) {
@@ -591,7 +731,8 @@ async function sponsor(txJson, ip) {
     const entry = Number(call.entry_point);
     const isMarket = target === CFG.MARKET_ADDR;
     const isApproval = registered.has(target) && APPROVAL_ENTRIES.has(entry);
-    if (!isMarket && !isApproval) {
+    const isCreatorOp = registered.has(target) && CREATOR_ENTRIES.has(entry);
+    if (!isMarket && !isApproval && !isCreatorOp) {
       return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
     }
   }
@@ -624,7 +765,7 @@ async function sponsor(txJson, ip) {
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif',
   '.json': 'application/json', '.ico': 'image/x-icon', '.woff2': 'font/woff2',
 };
 function json(res, status, body) {
@@ -639,6 +780,22 @@ function readBody(req) {
     req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch (_) { resolve({}); } });
   });
 }
+/* Uploaded art. The name IS the content hash, so it can never change and
+   is cached hard; the route pattern is the only path that reaches here,
+   which keeps a filename from walking out of the directory. */
+function serveUpload(res, name) {
+  const file = path.join(UPLOAD_DIR, name);
+  if (!file.startsWith(UPLOAD_DIR) || !fs.existsSync(file)) { res.writeHead(404); return res.end('not found'); }
+  const ext = path.extname(file);
+  res.writeHead(200, {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Access-Control-Allow-Origin': '*',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  fs.createReadStream(file).pipe(res);
+}
+
 function serveStatic(res, urlPath) {
   const clean = path.normalize(urlPath).replace(/^(\.\.[/\\])+/, '');
   let file = path.join(__dirname, 'public', clean);
@@ -740,10 +897,17 @@ const api = {
     });
   },
 
+  /** Adding a collection is open to anyone: the chain already decides what
+      is real, so this only checks that the address answers as KCS-2 and
+      rate-limits the obvious abuse. Only `featured` stays privileged. */
   async collections(req, res) {
     if (req.method === 'POST') {
       const body = await readBody(req);
-      if (!CFG.ADMIN_KEY || body.key !== CFG.ADMIN_KEY) return json(res, 403, { error: 'Forbidden' });
+      const admin = !!CFG.ADMIN_KEY && body.key === CFG.ADMIN_KEY;
+      const ip = clientIp(req);
+      if (!admin && rateLimited('addcol:' + ip, 10, DAY)) {
+        return json(res, 429, { error: 'That is a lot of collections for one day — try again tomorrow' });
+      }
       const addr = String(body.address || '').trim();
       if (!isAddr(addr)) return json(res, 400, { error: 'A Koinos address is required' });
       if (registry.collections.some(c => c.address === addr)) return json(res, 400, { error: 'Already registered' });
@@ -751,8 +915,9 @@ const api = {
       if (!info.name && !info.symbol) return json(res, 400, { error: 'That address does not answer as a KCS-2 collection' });
       registry.collections.push({
         address: addr, name: String(body.name || info.name || addr),
-        description: String(body.description || info.description || ''),
-        image: String(body.image || ''), featured: !!body.featured, addedAt: Date.now(),
+        description: String(body.description || info.description || '').slice(0, 1000),
+        image: safeImage(body.image) || '', featured: admin && !!body.featured,
+        addedBy: isAddr(body.by) ? body.by : null, addedAt: Date.now(),
       });
       saveJson(REGISTRY_FILE, registry);
       return json(res, 200, { ok: true, collection: info });
@@ -999,9 +1164,185 @@ const api = {
   async sponsor(req, res) {
     if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
     const body = await readBody(req);
-    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-    const r = await sponsor(body.transaction, ip);
+    const r = await sponsor(body.transaction, clientIp(req));
     json(res, r.status, r.body);
+  },
+
+  /** What launching costs and whether you may right now. */
+  async launchInfo(req, res, q) {
+    const who = String(q.get('owner') || '');
+    json(res, 200, {
+      feeKoin: CFG.LAUNCH_FEE_KOIN,
+      feeSats: KOIN_SATS(CFG.LAUNCH_FEE_KOIN).toString(),
+      treasury: CFG.MARKET_ADDR ? (await marketCfg()).treasury : null,
+      perAccountPerDay: CFG.LAUNCH_PER_DAY_PER_ACCOUNT,
+      usedToday: isAddr(who) ? launchesSince(DAY, who) : 0,
+      globalRemaining: Math.max(0, CFG.LAUNCH_PER_DAY_TOTAL - launchesSince(DAY, null)),
+      ready: !!dev && fs.existsSync(COLLECTION_WASM),
+    });
+  },
+
+  /** Step one: we build the transaction, the creator signs it.
+      Fee and contract upload ride together, so the fee cannot be taken
+      without the collection actually being created. */
+  async launchPrepare(req, res) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+    if (!dev) return json(res, 503, { error: 'Launching is not configured on this server' });
+    if (!fs.existsSync(COLLECTION_WASM)) return json(res, 503, { error: 'The collection contract is not built on this server' });
+
+    const body = await readBody(req);
+    const v = validateLaunch(body);
+    if (v.error) return json(res, 400, { error: v.error });
+
+    if (launchesSince(DAY, v.owner) >= CFG.LAUNCH_PER_DAY_PER_ACCOUNT) {
+      return json(res, 429, { error: `Only ${CFG.LAUNCH_PER_DAY_PER_ACCOUNT} collections per wallet per day — try again tomorrow` });
+    }
+    if (launchesSince(DAY, null) >= CFG.LAUNCH_PER_DAY_TOTAL) {
+      return json(res, 429, { error: 'The launch queue is full for today — try again tomorrow' });
+    }
+    if (rateLimited('launch-ip:' + clientIp(req), 6, DAY)) {
+      return json(res, 429, { error: 'Too many launches from here today' });
+    }
+
+    const treasury = (await marketCfg()).treasury;
+    if (CFG.LAUNCH_FEE_KOIN > 0 && !isAddr(treasury)) {
+      return json(res, 503, { error: 'No treasury is configured to receive the launch fee' });
+    }
+
+    // The collection's own account: fresh key, used to authorize its
+    // upload and setup, then kept as the upgrade key.
+    const key = new Signer({ privateKey: crypto.randomBytes(32).toString('hex') });
+    key.provider = provider;
+    const address = key.getAddress();
+
+    const ops = [];
+    if (CFG.LAUNCH_FEE_KOIN > 0) {
+      const koinC = new Contract({ id: NET.koinContract, provider, abi: TOKEN_ABI });
+      ops.push(await koinC.encodeOperation({
+        name: 'transfer',
+        args: { from: v.owner, to: treasury, value: KOIN_SATS(CFG.LAUNCH_FEE_KOIN).toString() },
+      }));
+    }
+    ops.push({
+      upload_contract: {
+        contract_id: address,
+        // base64URL: koilib rejects the '+' and '/' of plain base64.
+        bytecode: fs.readFileSync(COLLECTION_WASM).toString('base64url'),
+      },
+    });
+
+    const tx = new Transaction({
+      signer: key, provider,
+      options: { payer: dev.getAddress(), payee: v.owner, rcLimit: String(80e8) },
+    });
+    for (const op of ops) await tx.pushOperation(op);
+    await tx.prepare();
+    await tx.sign();                     // the collection account authorizes its own upload
+
+    pendingLaunches.set(tx.transaction.id, {
+      at: Date.now(), wif: key.getPrivateKey('wif', true), address,
+      spec: v, header: JSON.stringify(tx.transaction.header),
+    });
+    for (const [id, p] of pendingLaunches) {
+      if (Date.now() - p.at > 900000) pendingLaunches.delete(id);
+    }
+
+    json(res, 200, {
+      transaction: tx.transaction,
+      collection: address,
+      feeKoin: CFG.LAUNCH_FEE_KOIN,
+    });
+  },
+
+  /** Step two: the creator's signature comes back, we co-sign and send.
+      Then the collection is named and handed over, and registered here. */
+  async launchSubmit(req, res) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+    if (!dev) return json(res, 503, { error: 'Launching is not configured on this server' });
+    const body = await readBody(req);
+    const signed = body.transaction;
+    const pending = signed && signed.id ? pendingLaunches.get(signed.id) : null;
+    if (!pending) return json(res, 400, { error: 'That launch has expired — start again' });
+    // The signed copy must be the one we built, byte for byte.
+    if (JSON.stringify(signed.header) !== pending.header) {
+      return json(res, 400, { error: 'The transaction was altered after it was prepared' });
+    }
+    let signers = [];
+    try { signers = await Signer.recoverAddresses(signed); } catch (_) {}
+    if (!signers.includes(pending.spec.owner)) {
+      return json(res, 400, { error: 'The creator has not signed this launch' });
+    }
+
+    pendingLaunches.delete(signed.id);
+    const key = Signer.fromWif(pending.wif);
+    key.provider = provider;
+
+    try {
+      await dev.signTransaction(signed);          // payer
+      const tx = new Transaction({ provider });
+      tx.transaction = signed;
+      await tx.send();
+      await tx.wait('byTransactionId', 60000);
+    } catch (e) {
+      return json(res, 400, { error: `The collection could not be deployed: ${String((e && e.message) || e).slice(0, 200)}` });
+    }
+
+    /* Named and handed over. Separate transaction because the contract has
+       to exist before it can be called; we hold the key, so a failure here
+       is retryable rather than lost. */
+    const spec = pending.spec;
+    let initialized = false;
+    for (let attempt = 0; attempt < 3 && !initialized; attempt++) {
+      try {
+        const c = new Contract({ id: pending.address, provider, abi: COLLECTION_ABI, signer: key });
+        const { transaction } = await c.functions.initialize({
+          name: spec.name, symbol: spec.symbol, uri: spec.uri, description: spec.description,
+          owner: spec.owner, royalty_bps: String(spec.royaltyBps), royalty_address: spec.owner,
+        }, {
+          payer: dev.getAddress(), payee: dev.getAddress(), rcLimit: String(5e8),
+          beforeSend: async (t) => { await dev.signTransaction(t); },
+        });
+        await transaction.wait('byTransactionId', 60000);
+        initialized = true;
+      } catch (e) {
+        console.error('[launch] initialize attempt failed —', String((e && e.message) || e).slice(0, 200));
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+
+    rememberCollectionKey(pending.address, pending.wif, spec.owner);
+    launches.items.push({ address: pending.address, owner: spec.owner, at: Date.now(), initialized });
+    try { saveJson(LAUNCH_LOG, launches); } catch (_) {}
+
+    if (!registry.collections.some(c => c.address === pending.address)) {
+      registry.collections.push({
+        address: pending.address, name: spec.name, description: spec.description,
+        image: spec.image || '', featured: false, addedBy: spec.owner, addedAt: Date.now(),
+        launched: true,
+      });
+      saveJson(REGISTRY_FILE, registry);
+    }
+    caches.delete('info:' + pending.address);
+
+    json(res, 200, { ok: true, collection: pending.address, initialized });
+  },
+
+  /** Artwork, either uploaded here or linked from anywhere. Uploads are
+      content-addressed, so the same picture twice costs one file. */
+  async upload(req, res) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+    if (rateLimited('upload:' + clientIp(req), 120, 3600000)) {
+      return json(res, 429, { error: 'Too many uploads — slow down' });
+    }
+    const buf = await readRaw(req, CFG.UPLOAD_MAX_BYTES);
+    if (!buf) return json(res, 413, { error: `Images must be ${Math.round(CFG.UPLOAD_MAX_BYTES / 1048576)}MB or smaller` });
+    const kind = imageKind(buf);
+    if (!kind) return json(res, 400, { error: 'That file is not a PNG, JPEG, GIF or WebP image' });
+    const hash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 40);
+    const file = path.join(UPLOAD_DIR, `${hash}.${kind}`);
+    try { if (!fs.existsSync(file)) fs.writeFileSync(file, buf); }
+    catch (e) { return json(res, 500, { error: 'Could not store that image' }); }
+    json(res, 200, { ok: true, url: `${publicOrigin(req)}/u/${hash}.${kind}`, path: `/u/${hash}.${kind}`, bytes: buf.length });
   },
 
   async balance(req, res, q) {
@@ -1009,7 +1350,7 @@ const api = {
     if (!isAddr(addr)) return json(res, 400, { error: 'bad address' });
     let koin = '0', mana = '0';
     try {
-      const koinC = new Contract({ id: NET.koinContract, provider, abi: utils.tokenAbi });
+      const koinC = new Contract({ id: NET.koinContract, provider, abi: TOKEN_ABI });
       koin = (await koinC.functions.balanceOf({ owner: addr })).result?.value || '0';
     } catch (_) {}
     try { mana = String(await provider.getAccountRc(addr)); } catch (_) {}
@@ -1036,6 +1377,11 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/balance') return await api.balance(req, res, url.searchParams);
     if (p === '/api/history') return await api.history(req, res, url.searchParams);
     if (p === '/api/diag') return await api.diag(req, res, url.searchParams);
+    if (p === '/api/launch') return await api.launchInfo(req, res, url.searchParams);
+    if (p === '/api/launch/prepare') return await api.launchPrepare(req, res);
+    if (p === '/api/launch/submit') return await api.launchSubmit(req, res);
+    if (p === '/api/upload') return await api.upload(req, res);
+    if ((m = /^\/u\/([a-f0-9]{8,64}\.(?:png|jpg|gif|webp))$/.exec(p))) return serveUpload(res, m[1]);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });
     return serveStatic(res, p === '/' ? '/index.html' : p);
   } catch (e) {
