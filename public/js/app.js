@@ -408,8 +408,12 @@ async function collectionView(addr, queryString) {
     if (e.key === 'Escape') drawer(false);
   });
 
-  // Land on what is for sale when there is something for sale.
-  if (!state.get('status') && data.orders.length) state.set('status', 'listed');
+  /* Land on what is for sale — but only when arriving with no filters of
+     your own. A shared ?t=Rarity:rare link that quietly also means "and
+     for sale" lands on an empty grid with the box ticked, which reads as
+     broken rather than as a default. */
+  const arrivedFiltered = state.getAll('t').length > 0 || !!state.get('q') || !!state.get('status');
+  if (!arrivedFiltered && data.orders.length) state.set('status', 'listed');
   apply();
 }
 
@@ -654,6 +658,266 @@ async function listView(addr, tokenId) {
   };
 }
 
+/* ---------------- creating ----------------
+
+   Three doors: bring a collection that already exists, launch a new one,
+   or mint into one you own. */
+
+/** Art: a file goes to OURO, a link goes in as-is. Returns a url or null. */
+function artField(id, label) {
+  return `
+    <label>${label}</label>
+    <div class="art-pick">
+      <div class="art-prev" id="${id}-prev"><span>no image</span></div>
+      <div class="art-ctl">
+        <input type="file" id="${id}-file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+        <button class="btn" id="${id}-btn" type="button">Upload an image</button>
+        <div class="alt">or paste a link</div>
+        <input id="${id}-url" type="url" placeholder="https://… or ipfs://…">
+      </div>
+    </div>`;
+}
+function wireArt(id) {
+  const state = { url: '' };
+  const prev = $(`#${id}-prev`), urlEl = $(`#${id}-url`), fileEl = $(`#${id}-file`);
+  const show = (u) => {
+    state.url = u || '';
+    prev.innerHTML = u ? `<img src="${esc(u)}" alt="">` : '<span>no image</span>';
+  };
+  $(`#${id}-btn`).onclick = () => fileEl.click();
+  fileEl.onchange = async () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    $(`#${id}-btn`).disabled = true;
+    $(`#${id}-btn`).innerHTML = '<span class="spin"></span> Uploading…';
+    try {
+      const r = await fetch('/api/upload', { method: 'POST', headers: { 'Content-Type': f.type }, body: f });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || 'Upload failed');
+      urlEl.value = d.url;
+      show(d.url);
+      toast('Image uploaded', 'good');
+    } catch (e) { toast(esc(e.message), 'bad'); }
+    $(`#${id}-btn`).disabled = false;
+    $(`#${id}-btn`).textContent = 'Upload an image';
+  };
+  urlEl.oninput = () => show(urlEl.value.trim());
+  return { get: () => (urlEl.value.trim() || state.url || '') };
+}
+
+async function createView(tab) {
+  const me = Wallet.account && Wallet.account.address;
+  const info = await api('/launch?owner=' + (me || '')).catch(() => ({ feeKoin: 0, ready: false }));
+  const on = (t) => (tab === t ? ' on' : '');
+  view.innerHTML = `
+    <section class="hero" style="padding-bottom:4px">
+      <h1 style="font-size:26px">Create</h1>
+      <p>Bring a collection that already exists on Koinos, launch a brand new one,
+      or mint into a collection you own. Mana is on us throughout.</p>
+    </section>
+    <div class="tabs">
+      <button class="tab${on('launch')}" data-t="launch">Launch a collection</button>
+      <button class="tab${on('add')}" data-t="add">Add an existing one</button>
+      <button class="tab${on('mint')}" data-t="mint">Mint an NFT</button>
+    </div>
+    <div id="cr-body"></div>`;
+  view.querySelectorAll('.tab').forEach((t) => (t.onclick = () => { location.hash = '#/create/' + t.dataset.t; }));
+
+  const body = $('#cr-body');
+  if (tab === 'add') return createAdd(body);
+  if (tab === 'mint') return createMint(body, me);
+  return createLaunch(body, me, info);
+}
+
+function createAdd(body) {
+  body.innerHTML = `
+    <div class="form-card">
+      <h3>Add an existing collection</h3>
+      <p class="sub">Any KCS-2 collection on Koinos can be listed here. Paste its
+      contract address — we read the name, symbol and supply straight off the chain.</p>
+      <label for="ad-addr">Contract address</label>
+      <input id="ad-addr" placeholder="1…" spellcheck="false">
+      <label for="ad-desc">Description <span class="dim">(optional)</span></label>
+      <textarea id="ad-desc" rows="3" placeholder="What is this collection?"></textarea>
+      ${artField('ad-img', 'Cover image <span class="dim">(optional)</span>')}
+      <button class="btn primary big" id="ad-go">Add collection</button>
+    </div>`;
+  const art = wireArt('ad-img');
+  $('#ad-go').onclick = async () => {
+    const address = $('#ad-addr').value.trim();
+    if (!address) return toast('Paste a contract address', 'bad');
+    const btn = $('#ad-go');
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Checking the chain…';
+    try {
+      const r = await fetch('/api/collections', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          address, description: $('#ad-desc').value.trim(), image: art.get(),
+          by: Wallet.account ? Wallet.account.address : null,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || 'Could not add that collection');
+      toast(`Added ${esc(d.collection.name || address)}`, 'good');
+      location.hash = '#/c/' + address;
+    } catch (e) {
+      toast(esc(e.message), 'bad', 7000);
+      btn.disabled = false; btn.textContent = 'Add collection';
+    }
+  };
+}
+
+function createLaunch(body, me, info) {
+  const fee = Number(info.feeKoin || 0);
+  body.innerHTML = `
+    <div class="form-card">
+      <h3>Launch a new collection</h3>
+      <p class="sub">Deploys your own NFT contract on Koinos. You own it outright —
+      minting, metadata and royalties are yours. ${fee > 0
+        ? `Launching costs <b>${fee} KOIN</b>, which covers deploying the contract.`
+        : 'Launching is free right now.'}</p>
+      ${info.ready === false ? '<div class="warn">Launching is not configured on this server yet.</div>' : ''}
+      <label for="lc-name">Collection name</label>
+      <input id="lc-name" maxlength="64" placeholder="Moonlit Wanderers">
+      <label for="lc-sym">Symbol</label>
+      <input id="lc-sym" maxlength="16" placeholder="MOON" spellcheck="false" style="text-transform:uppercase">
+      <label for="lc-desc">Description <span class="dim">(optional)</span></label>
+      <textarea id="lc-desc" rows="3" maxlength="1000" placeholder="What is this collection about?"></textarea>
+      ${artField('lc-img', 'Cover image <span class="dim">(optional)</span>')}
+      <label for="lc-roy">Creator royalty — you earn this on every resale</label>
+      <div class="price-field">
+        <input id="lc-roy" type="number" min="0" max="10" step="0.25" value="5">
+        <span>%</span>
+      </div>
+      <div class="breakdown" id="lc-break"></div>
+      <button class="btn primary big" id="lc-go"${info.ready === false ? ' disabled' : ''}>
+        ${fee > 0 ? `Launch for ${fee} KOIN` : 'Launch collection'}</button>
+      <div class="fee-note">Deploying takes a few seconds. Your wallet signs once: that
+      signature pays the fee and authorizes the deployment together, so one cannot
+      happen without the other.</div>
+    </div>`;
+  const art = wireArt('lc-img');
+  const brk = $('#lc-break');
+  const paint = () => {
+    const roy = Math.max(0, Math.min(10, Number($('#lc-roy').value || 0)));
+    brk.innerHTML =
+      `<div class="brow"><span>Launch fee</span><b>${fee > 0 ? fee + ' KOIN' : 'free'}</b></div>` +
+      `<div class="brow"><span>Mana for deployment</span><b>on us</b></div>` +
+      `<div class="brow"><span>Your royalty on resales</span><b>${roy.toFixed(2)}%</b></div>` +
+      `<div class="brow total"><span>Collections left today</span><b>${info.globalRemaining ?? '—'}</b></div>`;
+  };
+  $('#lc-roy').oninput = paint; paint();
+
+  $('#lc-go').onclick = async () => {
+    if (!Wallet.account) return connectModal();
+    const name = $('#lc-name').value.trim();
+    const symbol = $('#lc-sym').value.trim().toUpperCase();
+    if (!name) return toast('Give the collection a name', 'bad');
+    if (!/^[A-Z0-9]{1,16}$/.test(symbol)) return toast('Symbol must be 1-16 letters or digits', 'bad');
+    const btn = $('#lc-go');
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Deploying — this takes a moment…';
+    try {
+      const r = await Wallet.launchCollection({
+        name, symbol,
+        description: $('#lc-desc').value.trim(),
+        image: art.get(),
+        royaltyBps: Math.round(Math.max(0, Math.min(10, Number($('#lc-roy').value || 0))) * 100),
+      });
+      toast(r.initialized ? '🎉 Your collection is live' : 'Deployed — finishing setup…', 'good', 8000);
+      location.hash = '#/c/' + r.collection;
+    } catch (e) {
+      toast(esc(e.message), 'bad', 9000);
+      btn.disabled = false; btn.textContent = fee > 0 ? `Launch for ${fee} KOIN` : 'Launch collection';
+    }
+  };
+}
+
+async function createMint(body, me) {
+  if (!me) { body.innerHTML = '<div class="empty">Connect a wallet to mint.</div>'; connectModal(); return; }
+  body.innerHTML = '<div class="loading"><span class="spin"></span> Finding collections you own…</div>';
+  const { collections } = await api('/collections');
+  const mine = [];
+  for (const c of collections) {
+    try {
+      const t = await api('/collections/' + c.address);
+      if ((t.info && t.info.owner) === me) mine.push(c);
+    } catch (_) {}
+  }
+  body.innerHTML = `
+    <div class="form-card">
+      <h3>Mint an NFT</h3>
+      ${mine.length ? '' : `<div class="warn">No collections here are owned by your wallet yet.
+        <a href="#/create/launch">Launch one</a> and it will appear.</div>`}
+      <label for="mt-col">Collection</label>
+      <select id="mt-col">${mine.map((c) => `<option value="${c.address}">${esc(c.name || c.address)}</option>`).join('')}</select>
+      <label for="mt-name">Name of this NFT</label>
+      <input id="mt-name" maxlength="80" placeholder="Wanderer #1">
+      <label for="mt-id">Token id <span class="dim">— its permanent identifier</span></label>
+      <input id="mt-id" maxlength="32" placeholder="WANDERER0001" spellcheck="false">
+      <label for="mt-desc">Description <span class="dim">(optional)</span></label>
+      <textarea id="mt-desc" rows="3" placeholder="Anything a collector should know"></textarea>
+      ${artField('mt-img', 'Artwork')}
+      <label>Traits <span class="dim">(optional)</span></label>
+      <div id="mt-traits"></div>
+      <button class="btn" id="mt-addtrait" type="button">+ Add a trait</button>
+      <button class="btn primary big" id="mt-go"${mine.length ? '' : ' disabled'}>Mint it</button>
+      <div class="fee-note">The NFT is minted to your wallet with its metadata written on chain.
+      Mana is on us.</div>
+    </div>`;
+  const art = wireArt('mt-img');
+  const traits = $('#mt-traits');
+  const addTrait = () => {
+    const row = document.createElement('div');
+    row.className = 'trait-row';
+    row.innerHTML = `<input placeholder="Trait (e.g. Rarity)" class="t-k">
+      <input placeholder="Value (e.g. rare)" class="t-v">
+      <button class="btn t-x" type="button" aria-label="Remove">✕</button>`;
+    row.querySelector('.t-x').onclick = () => row.remove();
+    traits.appendChild(row);
+  };
+  $('#mt-addtrait').onclick = addTrait;
+
+  $('#mt-go').onclick = async () => {
+    const collection = $('#mt-col').value;
+    const name = $('#mt-name').value.trim();
+    const rawId = $('#mt-id').value.trim();
+    if (!collection) return toast('Pick a collection', 'bad');
+    if (!name) return toast('Give the NFT a name', 'bad');
+    if (!/^[\x20-\x7e]{1,32}$/.test(rawId)) return toast('Token id must be 1-32 plain characters', 'bad');
+    const image = art.get();
+    if (!image) return toast('Add artwork — upload a file or paste a link', 'bad');
+
+    const attributes = [...traits.querySelectorAll('.trait-row')].map((r) => ({
+      trait_type: r.querySelector('.t-k').value.trim(),
+      value: r.querySelector('.t-v').value.trim(),
+    })).filter((a) => a.trait_type && a.value);
+
+    // Token ids travel as hex, the way every KCS-2 collection stores them.
+    const tokenId = '0x' + [...rawId].map((ch) => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+    const btn = $('#mt-go');
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Minting…';
+    try {
+      await Wallet.mintToken(collection, tokenId, {
+        name, description: $('#mt-desc').value.trim(),
+        image: image.startsWith('/u/') ? location.origin + image : image,
+        attributes,
+      });
+      toast('Minted — waiting for the block…', 'good');
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const t = await api(`/collections/${collection}/token/${encodeURIComponent(tokenId)}`);
+          if (t.owner) { toast('🎉 Minted', 'good', 6000); location.hash = `#/t/${collection}/${encodeURIComponent(tokenId)}`; return; }
+        } catch (_) {}
+      }
+      toast('Still settling — check the collection in a moment.', '', 7000);
+    } catch (e) {
+      toast(esc(e.message), 'bad', 9000);
+      btn.disabled = false; btn.textContent = 'Mint it';
+    }
+  };
+}
+
 async function meView() {
   if (!Wallet.account) { connectModal(); view.innerHTML = '<div class="empty">Connect a wallet to see your items.</div>'; return; }
   view.innerHTML = '<div class="loading"><span class="spin"></span> Reading your wallet…</div>';
@@ -680,6 +944,7 @@ async function route() {
     if ((m = /^#\/c\/([1-9A-HJ-NP-Za-km-z]+)(?:\?(.*))?$/.exec(h))) return await collectionView(m[1], m[2] || '');
     if ((m = /^#\/t\/([1-9A-HJ-NP-Za-km-z]+)\/([^/?]+)$/.exec(h))) return await tokenView(m[1], decodeURIComponent(m[2]));
     if ((m = /^#\/list\/([1-9A-HJ-NP-Za-km-z]+)\/([^/?]+)$/.exec(h))) return await listView(m[1], decodeURIComponent(m[2]));
+    if ((m = /^#\/create(?:\/(launch|add|mint))?$/.exec(h))) return await createView(m[1] || 'launch');
     if (h === '#/me') return await meView();
     return await homeView();
   } catch (e) {

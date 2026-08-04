@@ -76,7 +76,11 @@ MARKET_ADDR=<deployed address> KOINOS_DEV_WIF=<dev wif> node server.js
 | `AURVANIA_API` | sign-in bridge target (default `https://aurvania.quest`) |
 | `GOOGLE_CLIENT_ID` | the game's Google OAuth client id — set it so sign-in does not depend on the bridge being reachable |
 | `BRIDGE_UA` | User-Agent used when calling the game (default clears its host's filter) |
-| `ADMIN_KEY` | enables `POST /api/collections` to register collections |
+| `ADMIN_KEY` | privileged registry fields (`featured`) — adding collections needs no key |
+| `LAUNCH_FEE_KOIN` | cost to launch a collection (default 100; set 0 for free) |
+| `LAUNCH_PER_DAY_PER_ACCOUNT` | launches per wallet per day (default 3) |
+| `LAUNCH_PER_DAY_TOTAL` | launches per day across the site (default 12) |
+| `UPLOAD_MAX_BYTES` | largest image accepted (default 4MB) |
 | `DATA_DIR` | runtime state (registry), default `./data-live` |
 
 ### One login, one wallet, two sites
@@ -153,6 +157,33 @@ serves them, so a trade made straight against the contract — bypassing this
 site — still shows up. The walk is incremental (records carry a sequence
 number) and is written to `DATA_DIR/history.json` so a restart does not
 re-read the chain.
+
+### Creating: add, launch, mint
+
+`/#/create` has three doors, and all of them are open to anyone:
+
+* **Add an existing collection** — any KCS-2 address on Koinos. No admin key;
+  the server checks the contract actually answers and rate-limits abuse.
+* **Launch a new one** — deploys `contracts/collection`, one generic binary
+  whose name, symbol, uri and royalty are written into state at setup, so
+  every collection ever launched runs identical, reviewable code. It goes to
+  its own fresh account; OURO keeps that account's key as the upgrade
+  authority while the CREATOR owns the collection (mint, metadata,
+  royalties). Keys are written 0600, returned by no endpoint, logged nowhere.
+* **Mint** — mints to your wallet and writes the metadata on chain in one
+  transaction, traits included.
+
+An upload costs ~59 KOIN of mana against ~1 for an ordinary call, measured
+on this marketplace's own deployment. Roughly 28 launches would drain the
+sponsor wallet and freeze trading for everyone until it recharges, so a
+launch is both paid for (`LAUNCH_FEE_KOIN`, default 100) and rationed. The
+fee and the contract upload ride in ONE transaction, so a fee cannot be
+taken without a collection being created.
+
+Minting is covered by the existing sponsor: `mint`, `set_metadata`,
+`set_royalties` and `transfer_ownership` are payable on registered
+collections. That is safe because the collection itself decides who may run
+them — the contract checks the caller owns it.
 
 ### Adding collections
 

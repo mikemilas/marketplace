@@ -213,6 +213,42 @@ const Wallet = (() => {
     return send([op]);
   }
 
+  /** Mint into a collection you own, metadata and all, in one transaction. */
+  async function mintToken(collection, tokenId, metadata) {
+    const { nft } = await loadAbis();
+    const ops = [
+      await encodeOp(collection, nft, 'mint', { to: account.address, token_id: tokenId }),
+    ];
+    if (metadata) {
+      ops.push(await encodeOp(collection, nft, 'set_metadata', {
+        token_id: tokenId, metadata: JSON.stringify(metadata),
+      }));
+    }
+    return send(ops);
+  }
+
+  /** Launch a collection: the server builds it, you sign it, the server
+      co-signs and deploys. Your signature is what pays the fee. */
+  async function launchCollection(spec) {
+    if (!account) throw new Error('Connect a wallet first');
+    const prep = await (await fetch('/api/launch/prepare', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...spec, owner: account.address }),
+    })).json();
+    if (prep.error) throw new Error(prep.error);
+
+    const tx = new Transaction({ signer: account.signer, provider });
+    tx.transaction = prep.transaction;
+    await tx.sign();
+
+    const done = await (await fetch('/api/launch/submit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transaction: tx.transaction }),
+    })).json();
+    if (done.error) throw new Error(humanError(done.error));
+    return done;
+  }
+
   async function cancelOrder(collection, tokenId) {
     const { market } = await loadAbis();
     const op = await encodeOp(cfg.market, market, 'cancel_order', {
@@ -223,7 +259,7 @@ const Wallet = (() => {
 
   return {
     init, onChange, connectKondor, hostedLogin, disconnect, adoptWif,
-    listToken, buyToken, cancelOrder,
+    listToken, buyToken, cancelOrder, mintToken, launchCollection,
     get account() { return account; },
     get cfg() { return cfg; },
     get provider() { return provider; },

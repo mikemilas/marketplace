@@ -10,6 +10,8 @@ const SCRATCH = process.env.TEST_TMP || os.tmpdir();
 /* Playwright is not a dependency of the marketplace itself — point
    PLAYWRIGHT_DIR at any install that has it (and CHROMIUM at a browser). */
 const { chromium } = require(process.env.PLAYWRIGHT_DIR || 'playwright');
+const crypto = require('crypto');
+const { Signer } = require('koilib');
 const PORT = 3979;
 let srv, browser, fails = 0;
 const check = (label, ok, detail) => {
@@ -24,7 +26,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   fs.rmSync(dataDir, { recursive: true, force: true });
   srv = spawn('node', ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: Object.assign({}, process.env, { PORT: String(PORT), DATA_DIR: dataDir, KOINOS_NETWORK: 'mainnet' }),
+    /* A throwaway payer with no KOIN: enough for the server to report
+       launching as configured, never enough to actually spend. */
+    env: Object.assign({}, process.env, {
+      PORT: String(PORT), DATA_DIR: dataDir, KOINOS_NETWORK: 'mainnet',
+      MARKET_ADDR: '1BsZx4Hc69tWo1q9sXNP9ywvpBW2KdXwc8',
+      KOINOS_DEV_WIF: new Signer({ privateKey: crypto.randomBytes(32).toString('hex') }).getPrivateKey('wif', true),
+    }),
     stdio: ['ignore', 'ignore', 'ignore'],
   });
   for (let i = 0; i < 40; i++) {
@@ -89,7 +97,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await page.waitForSelector('.deal', { timeout: 30000 });
   const t3 = await page.evaluate(() => document.body.innerText);
   check('the token page shows owner and deal box', /Owner/.test(t3), t3.slice(0, 120));
-  check('…and an unlisted token says so', /Not listed/i.test(t3), 'deal box copy missing');
+  /* Whether this token is for sale depends on the live order book, so
+     assert the page AGREES WITH THE CHAIN rather than expecting one of
+     the two states. */
+  const shownId = await page.evaluate(() => decodeURIComponent(location.hash.split('/').pop()));
+  const chainSays = await (await fetch(`http://127.0.0.1:${PORT}/api/collections/${RELICS}/token/${encodeURIComponent(shownId)}`)).json();
+  const listedNow = !!(chainSays.order && !chainSays.order.dead);
+  check(listedNow ? '…and a listed token shows its price and a way to buy' : '…and an unlisted token says so',
+    listedNow ? /KOIN/.test(t3) && /(Buy now|your listing)/i.test(t3) : /Not listed/i.test(t3),
+    `listed=${listedNow} :: ${t3.slice(0, 140)}`);
   await page.screenshot({ path: `${SCRATCH}/mk-3-token.png` });
 
   // ---- connect modal ----
@@ -269,6 +285,71 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     header: document.querySelector('.top-actions').innerText.trim(),
   }));
   check('the network chip beside "My items" is gone', !chip.net && !/Koinos/.test(chip.header), JSON.stringify(chip));
+
+
+  /* ---- create: add, launch, mint ---- */
+  await page.goto(`http://127.0.0.1:${PORT}/#/create/add`, { waitUntil: 'load' });
+  await page.waitForSelector('#ad-go', { timeout: 20000 });
+  const addForm = await page.evaluate(() => ({
+    tabs: [...document.querySelectorAll('.tabs .tab')].map(t => t.textContent.trim()),
+    hasAddr: !!document.querySelector('#ad-addr'),
+    hasUpload: !!document.querySelector('#ad-img-file'),
+    hasLink: !!document.querySelector('#ad-img-url'),
+  }));
+  check('Create offers all three doors',
+    addForm.tabs.length === 3 && /Launch/.test(addForm.tabs[0]) && /existing/i.test(addForm.tabs[1]) && /Mint/.test(addForm.tabs[2]),
+    JSON.stringify(addForm.tabs));
+  check('…adding an existing collection asks only for its address',
+    addForm.hasAddr, JSON.stringify(addForm));
+  check('…and artwork can be uploaded OR linked', addForm.hasUpload && addForm.hasLink, JSON.stringify(addForm));
+
+  // A junk address must be refused by the chain check, not accepted blindly.
+  await page.fill('#ad-addr', '1NotARealCollectionAddress11111111');
+  await page.click('#ad-go');
+  await page.waitForFunction(() => /toast/.test(document.querySelector('#toasts')?.innerHTML || ''), { timeout: 25000 });
+  const addErr = await page.evaluate(() => document.querySelector('#toasts').innerText);
+  check('…and an address that is not a collection is refused',
+    /not answer|required|Koinos address/i.test(addErr), addErr.slice(0, 120));
+
+  await page.goto(`http://127.0.0.1:${PORT}/#/create/launch`, { waitUntil: 'load' });
+  await page.waitForSelector('#lc-go', { timeout: 20000 });
+  const launch = await page.evaluate(() => ({
+    fee: document.querySelector('#lc-go').textContent.trim(),
+    breakdown: document.querySelector('#lc-break').innerText,
+    royalty: document.querySelector('#lc-roy').value,
+  }));
+  check('launching states the fee up front', /100 KOIN/.test(launch.fee), launch.fee);
+  check('…and breaks down fee, mana and royalty before you commit',
+    /Launch fee/i.test(launch.breakdown) && /on us/i.test(launch.breakdown) && /royalty/i.test(launch.breakdown),
+    launch.breakdown.replace(/\n/g, ' | ').slice(0, 160));
+
+  await page.fill('#lc-name', 'Moonlit Wanderers');
+  await page.fill('#lc-sym', 'not a symbol!');
+  await page.click('#lc-go');
+  await page.waitForFunction(() => /Symbol/.test(document.querySelector('#toasts')?.innerText || ''), { timeout: 15000 });
+  check('…a bad symbol is caught before any mana is spent',
+    /Symbol must be/.test(await page.evaluate(() => document.querySelector('#toasts').innerText)), 'no symbol warning');
+  await page.screenshot({ path: `${SCRATCH}/mk-8-launch.png` });
+
+  await page.goto(`http://127.0.0.1:${PORT}/#/create/mint`, { waitUntil: 'load' });
+  // Let the wallet-less render finish first: stubbing mid-flight leaves two
+  // renders racing, and the loser repaints over the winner.
+  await page.waitForSelector('#cr-body .empty, #cr-body .form-card', { timeout: 25000 });
+  await page.evaluate((addr) => {
+    Object.defineProperty(Wallet, 'account', { get: () => ({ kind: 'hosted', address: addr }), configurable: true });
+  }, '1JtWgDM3tN2zEFUmhMvSJF43dCGRNsJ83m');
+  await page.evaluate(() => route());
+  await page.waitForSelector('#mt-go', { timeout: 30000 });
+  const mint = await page.evaluate(() => {
+    document.querySelector('#mt-addtrait').click();
+    return {
+      fields: ['#mt-col', '#mt-name', '#mt-id', '#mt-desc', '#mt-img-file', '#mt-img-url'].filter(s => !!document.querySelector(s)).length,
+      traitRows: document.querySelectorAll('.trait-row').length,
+    };
+  });
+  check('minting asks for a collection, name, id, description and artwork', mint.fields === 6, JSON.stringify(mint));
+  check('…and traits can be added as key/value pairs', mint.traitRows === 1, JSON.stringify(mint));
+  await page.screenshot({ path: `${SCRATCH}/mk-9-mint.png` });
 
   check('no script errors anywhere', errs.length === 0, errs.slice(0, 2).join(' | '));
 

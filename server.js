@@ -221,6 +221,8 @@ async function collectionInfo(addr) {
       try { out.uri = (await c.functions.uri({})).result?.value; } catch (_) {}
     }
     try { out.totalSupply = (await c.functions.total_supply({})).result?.value || '0'; } catch (_) {}
+    // Who may mint into it — the answer the Create page needs.
+    try { out.owner = (await c.functions.owner({})).result?.value || null; } catch (_) { out.owner = null; }
     try {
       const { result } = await c.functions.royalties({});
       out.royaltyBps = (result?.value || []).reduce((s, r) => s + Number(r.percentage || 0), 0);

@@ -76,12 +76,24 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
   check('extensionless routes fall back to the app', (await spa.text()).includes('OURO'), String(spa.status));
 
   /* ---- registry rules ---- */
-  let r = await api('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'wrong', address: RELICS }) });
-  check('registry writes need the admin key', r.status === 403, JSON.stringify(r.body));
+  /* Registration is open to anyone now — the chain decides what is real.
+     What must still hold: a duplicate is refused, garbage is refused, and
+     `featured` stays privileged. */
+  let r = await api('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: RELICS }) });
+  check('adding a collection needs no admin key, but a duplicate is refused',
+    r.status === 400 && /Already/.test(r.body.error || ''), JSON.stringify(r.body));
   r = await api('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'test-admin-key', address: 'not-an-address' }) });
   check('…and a real address', r.status === 400, JSON.stringify(r.body));
-  r = await api('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'test-admin-key', address: RELICS }) });
-  check('…and a duplicate is refused', r.status === 400 && /Already/.test(r.body.error || ''), JSON.stringify(r.body));
+  r = await api('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: newSigner().getAddress() }) });
+  check('…and an address that answers as nothing is refused',
+    r.status === 400 && /KCS-2/.test(r.body.error || ''), JSON.stringify(r.body));
+
+  {
+    // Anyone may add; only the admin key may promote to the front page.
+    const cols = (await api('/api/collections')).body.collections || [];
+    check('…while `featured` stays privileged', cols.every(c => c.featured !== true || c.address === RELICS),
+      JSON.stringify(cols.map(c => [c.address, c.featured])));
+  }
 
   /* ---- the auth bridge only forwards the stateless actions ---- */
   r = await api('/api/account', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'link', email: 'x@x.com' }) });
