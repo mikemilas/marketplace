@@ -133,9 +133,13 @@ function sanitizeAbi(json) {
     return { rcLimit: limit.toString(), payer: devAddr, beforeSend: async (tx) => { await dev.signTransaction(tx); } };
   };
 
+  /* The bytecode rides on the Contract itself — koilib's deploy() uploads
+     this.bytecode, and without it fails with "bytecode not found" after
+     reading the wasm for nothing. */
   const marketC = new Contract({
     id: marketId, provider, signer: marketSigner,
     abi: sanitizeAbi(abiJson()),
+    bytecode: fs.readFileSync(wasmPath()),
   });
 
   async function send(label, fn) {
@@ -161,7 +165,7 @@ function sanitizeAbi(json) {
     if (live) {
       console.log('deploy:   contract already answers get_config — skipping upload');
     } else {
-      const bytes = fs.readFileSync(wasmPath());
+      const bytes = marketC.bytecode;
       const need = bytes.length * KOIN_PER_BYTE * 1.08;
       if (mana < need) {
         console.error(`deploy: needs ~${need.toFixed(1)} KOIN of mana in one transaction; the dev wallet has ${mana.toFixed(2)}.`);
