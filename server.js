@@ -567,7 +567,12 @@ async function refreshHistory({ force = false } = {}) {
 
 const pendingLaunches = new Map();      // prepared-but-unsigned launches
 const UPLOAD_DIR = path.join(CFG.DATA_DIR, 'uploads');
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+/* Losing uploads is survivable; losing the site is not. A read-only or
+   full disk here would otherwise throw at module load, before anything is
+   listening and before a single log line — which from outside is a bare
+   503 with nothing to read. */
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); }
+catch (e) { console.error('[uploads] directory unavailable —', String((e && e.message) || e)); }
 
 const clientIp = (req) =>
   String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
