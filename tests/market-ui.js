@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* The Bazaar frontend, driven in a real browser against live mainnet
+/* The OURO frontend, driven in a real browser against live mainnet
    reads: home -> collection -> token, plus the connect modal. */
 'use strict';
 const { spawn } = require('child_process');
@@ -60,7 +60,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'networkidle' });
   await page.waitForSelector('.col-card', { timeout: 30000 });
   const t1 = await page.evaluate(() => document.body.innerText);
-  check('the home page renders the hero', /One bazaar/i.test(t1) || /BAZAAR/.test(t1), t1.slice(0, 80));
+  check('the home page renders the hero', /endless market/i.test(t1) || /OURO/.test(t1), t1.slice(0, 80));
   check('…with the relics collection from live mainnet', /Relic/i.test(t1), 'collection missing');
   check('…and the fee is stated', t1.includes('2.5%'), 'fee not stated');
   await page.screenshot({ path: `${SCRATCH}/mk-1-home.png` });

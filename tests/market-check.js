@@ -66,9 +66,9 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
 
   const home = await fetch(`http://127.0.0.1:${PORT}/`);
   const html = await home.text();
-  check('the site is served', home.status === 200 && html.includes('BAZAAR'), String(home.status));
+  check('the site is served', home.status === 200 && html.includes('OURO'), String(home.status));
   const spa = await fetch(`http://127.0.0.1:${PORT}/c/whatever`);
-  check('extensionless routes fall back to the app', (await spa.text()).includes('BAZAAR'), String(spa.status));
+  check('extensionless routes fall back to the app', (await spa.text()).includes('OURO'), String(spa.status));
 
   /* ---- registry rules ---- */
   let r = await api('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'wrong', address: RELICS }) });

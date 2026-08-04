@@ -1,12 +1,13 @@
-# Bazaar — the Koinos NFT marketplace
+# OURO — the Koinos NFT marketplace
 
 Buy and sell NFTs from **every KCS-2 collection on Koinos**, in **KOIN**, with
 **zero mana fees** — the platform's dev wallet pays them for every user. A
 successor to [Kollection](https://github.com/kollection-nft/marketplace),
 whose open-source contract this design is ported from.
 
-*("Bazaar" is a working name — it lives in `public/index.html`, one CSS
-accent, and `assets/mark.svg`, so renaming is a ten-minute job.)*
+Lives at **[ouro.lifestyle](https://ouro.lifestyle)**. The mark is an
+ouroboros — the ring that feeds itself, which is also how the market works:
+everything a player earns can be sold, and everything sold stays in play.
 
 ## What it is
 

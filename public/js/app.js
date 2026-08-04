@@ -1,5 +1,5 @@
 /* ============================================================
-   Bazaar — the app. Hash-routed, no framework: four views over a thin
+   OURO — the app. Hash-routed, no framework: four views over a thin
    API, with every mutating action going through Wallet.send.
    ============================================================ */
 'use strict';
@@ -133,7 +133,7 @@ async function homeView() {
   const listed = collections.reduce((s, c) => s + (c.listed || 0), 0);
   view.innerHTML = `
     <section class="hero">
-      <h1>Every Koinos collection.<br>One <em>bazaar</em>.</h1>
+      <h1>Every Koinos collection.<br>One <em>endless</em> market.</h1>
       <p>Buy and sell NFTs in KOIN with zero mana fees — the marketplace pays
       them for you. 2.5% platform fee, collection royalties honored, and your
       Aurvania account works here out of the box.</p>

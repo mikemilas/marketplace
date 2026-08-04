@@ -568,7 +568,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(CFG.PORT, () => {
-  console.log(`🏪 marketplace listening on http://0.0.0.0:${CFG.PORT}`);
+  console.log(`⭕ OURO marketplace listening on http://0.0.0.0:${CFG.PORT}`);
   console.log(`   chain:   ${NET.label} · ${RPCS.join(', ')}`);
   console.log(`   market:  ${CFG.MARKET_ADDR || 'NOT SET — deploy the contract and set MARKET_ADDR'}`);
   console.log(`   sponsor: ${dev ? `on — payer ${dev.getAddress()}` : 'OFF (KOINOS_DEV_WIF not set)'}`);

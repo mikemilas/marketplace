@@ -2,7 +2,7 @@
   "name": "marketplace",
   "version": "0.1.0",
   "private": true,
-  "description": "Bazaar — an NFT marketplace for every KCS-2 collection on Koinos. KOIN prices, 2.5% platform fee, royalties honored, mana sponsored.",
+  "description": "OURO (ouro.lifestyle) \u2014 an NFT marketplace for every KCS-2 collection on Koinos. KOIN prices, 2.5% platform fee, royalties honored, mana sponsored.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
