@@ -219,6 +219,11 @@ async function tokenMeta(addr, tokenIdHex) {
 const rewriteImg = (u) => {
   if (typeof u !== 'string') return null;
   if (u.startsWith('ipfs://')) return 'https://ipfs.io/ipfs/' + u.slice(7);
+  /* Aurvania relics minted before the domain move carry the RETIRED domain
+     in their on-chain metadata — immutable history. Rewriting here keeps
+     the art loading directly (no redirect hop) and keeps working on the
+     day koinoscrusaders.com finally lapses. */
+  u = u.replace(/^https?:\/\/(www\.)?koinoscrusaders\.com\//, 'https://aurvania.quest/');
   return /^https:\/\//.test(u) ? u : null;
 };
 
