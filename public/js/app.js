@@ -51,7 +51,7 @@ function connectModal() {
     in the game. Mana fees are on us either way.</p>
     <div class="stack">
       <button class="btn big" id="w-kondor">🦅 Kondor wallet</button>
-      <button class="btn big" id="w-google">Sign in with Google</button>
+      <div id="w-google-slot"></div>
       <div class="alt">— or email —</div>
       <input id="w-email" type="email" placeholder="email" autocomplete="email">
       <input id="w-pass" type="password" placeholder="password" autocomplete="current-password">
@@ -63,18 +63,35 @@ function connectModal() {
     try { await Wallet.connectKondor(); closeModal(); toast('Kondor connected', 'good'); }
     catch (e) { toast(esc(e.message), 'bad'); }
   };
-  m.querySelector('#w-google').onclick = () => {
-    const cid = Wallet.cfg.googleClientId;
-    if (!cid || !window.google?.accounts?.id) return toast('Google sign-in is not available right now', 'bad');
+
+  /* Google, as a RENDERED button rather than One Tap. The first version
+     called google.accounts.id.prompt(), and One Tap is silently suppressed
+     all the time — third-party cookie settings, a previously dismissed
+     prompt (hours of backoff), private windows — which reads as a button
+     that simply does nothing. The rendered button uses the popup flow and
+     has none of those moods; it is what the game itself ships. */
+  const slot = m.querySelector('#w-google-slot');
+  const cid = Wallet.cfg.googleClientId;
+  if (cid && window.google?.accounts?.id) {
     window.google.accounts.id.initialize({
       client_id: cid,
+      ux_mode: 'popup',
       callback: async (resp) => {
         try { await Wallet.hostedLogin({ action: 'google', idToken: resp.credential }); closeModal(); toast('Signed in — same wallet as Aurvania', 'good'); }
         catch (e) { toast(esc(e.message), 'bad'); }
       },
     });
-    window.google.accounts.id.prompt();
-  };
+    window.google.accounts.id.renderButton(slot, {
+      theme: 'filled_black', size: 'large', text: 'signin_with',
+      shape: 'rect', logo_alignment: 'left', width: 352,
+    });
+  } else {
+    /* The GIS script did not load (blocked network, extension) or the id is
+       missing — say so instead of presenting a dead control. */
+    slot.innerHTML = '<button class="btn big" id="w-google-dead">Sign in with Google</button>';
+    slot.querySelector('#w-google-dead').onclick = () =>
+      toast(cid ? 'The Google sign-in script could not load — check for blockers, or use email' : 'Google sign-in is not configured — use email', 'bad', 6000);
+  }
   const emailAction = (action) => async () => {
     const email = m.querySelector('#w-email').value.trim();
     const password = m.querySelector('#w-pass').value;
