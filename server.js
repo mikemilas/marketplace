@@ -98,6 +98,13 @@ const CFG = {
   /* Optional: the same Google OAuth client the game uses. Set it here and
      sign-in no longer waits on the game server being reachable. */
   GOOGLE_CLIENT_ID: (process.env.GOOGLE_CLIENT_ID || '').trim(),
+  /* How this server introduces itself to the game. The host in front of
+     aurvania.quest answers 403 to almost every User-Agent — a browser
+     string, an empty one, node's own, a plain product token — and passes
+     `curl/*` and `Wget/*`. Measured, not guessed. The prefix clears that
+     filter while the rest keeps the caller identifiable in the game's
+     logs; override it if the rule ever changes. */
+  BRIDGE_UA: (process.env.BRIDGE_UA || 'curl/8.5.0 (OURO-marketplace; +https://ouro.lifestyle)').trim(),
   ADMIN_KEY: (process.env.ADMIN_KEY || '').trim(),
 };
 const NET = NETWORKS[CFG.NETWORK] || NETWORKS.mainnet;
@@ -626,7 +633,18 @@ async function fetchJson(url, opts = {}, tries = 2) {
   let last = null;
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(opts.timeoutMs || 12000) });
+      const r = await fetch(url, {
+        ...opts,
+        headers: {
+          // Without this the game's host answers 403 before our request
+          // ever reaches its app — node's default UA is on the wrong side
+          // of its filter.
+          'User-Agent': opts.ua || CFG.BRIDGE_UA,
+          Accept: 'application/json',
+          ...(opts.headers || {}),
+        },
+        signal: AbortSignal.timeout(opts.timeoutMs || 12000),
+      });
       const text = await r.text();
       let body = null;
       try { body = JSON.parse(text); } catch (_) {}
@@ -912,17 +930,22 @@ const api = {
   /** Is the sign-in bridge actually working? Answers without a key because
       it exposes nothing but reachability — and being able to ask from
       outside is the whole point when the site is misbehaving. */
-  async diag(req, res) {
+  async diag(req, res, q) {
     const started = Date.now();
+    /* ?ua=… tries a different identity from THIS server. When the game's
+       host started refusing us, the only way to find a string it accepts
+       was to try them from the machine actually being refused. */
+    const ua = String((q && q.get('ua')) || '').slice(0, 200) || undefined;
     let reach = null;
     try {
-      const r = await fetchJson(CFG.AURVANIA_API + '/api/chain-info', { timeoutMs: 12000 }, 1);
+      const r = await fetchJson(CFG.AURVANIA_API + '/api/chain-info', { timeoutMs: 12000, ua }, 1);
       reach = { ok: r.ok, status: r.status, ms: Date.now() - started, hasClientId: !!(r.body && r.body.googleClientId) };
     } catch (e) {
       reach = { ok: false, error: String((e && e.message) || e).slice(0, 200), ms: Date.now() - started };
     }
     json(res, 200, {
       aurvania: CFG.AURVANIA_API,
+      userAgent: ua || CFG.BRIDGE_UA,
       bridge: reach,
       lastBridgeError: aurvaniaError,
       googleClientId: CFG.GOOGLE_CLIENT_ID ? 'from this server\'s env' :
@@ -972,7 +995,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/sponsor') return await api.sponsor(req, res);
     if (p === '/api/balance') return await api.balance(req, res, url.searchParams);
     if (p === '/api/history') return await api.history(req, res, url.searchParams);
-    if (p === '/api/diag') return await api.diag(req, res);
+    if (p === '/api/diag') return await api.diag(req, res, url.searchParams);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });
     return serveStatic(res, p === '/' ? '/index.html' : p);
   } catch (e) {

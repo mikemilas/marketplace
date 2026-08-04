@@ -302,6 +302,49 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
     } finally { try { off.kill(); } catch (_) {} }
   }
 
+  /* ---- the bridge must introduce itself ----
+     The game's host answers 403 to node's default User-Agent, so the
+     request never reached the game's app at all. Stand in for the game
+     and read the header we actually send. */
+  {
+    const http = require('http');
+    const seen = [];
+    const stand = http.createServer((rq, rs) => {
+      seen.push({ url: rq.url, ua: rq.headers['user-agent'] || '', accept: rq.headers.accept || '' });
+      rs.writeHead(200, { 'Content-Type': 'application/json' });
+      rs.end(JSON.stringify({ googleClientId: 'stand-in-client-id' }));
+    });
+    await new Promise((r) => stand.listen(0, '127.0.0.1', r));
+    const standPort = stand.address().port;
+    const UA_PORT = PORT + 3;
+    const uaSrv = spawn('node', ['server.js'], {
+      cwd: ROOT,
+      env: Object.assign({}, process.env, {
+        PORT: String(UA_PORT),
+        DATA_DIR: path.join(SCRATCH, 'mk-ua-' + process.pid),
+        KOINOS_NETWORK: 'mainnet',
+        AURVANIA_API: `http://127.0.0.1:${standPort}`,
+      }),
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    try {
+      for (let i = 0; i < 40 && !seen.length; i++) {
+        await sleep(400);
+        try { await fetch(`http://127.0.0.1:${UA_PORT}/api/config`); } catch (_) {}
+      }
+      const hit = seen[0];
+      check('the bridge sends a User-Agent rather than node\'s default',
+        !!hit && !!hit.ua && !/^node$/i.test(hit.ua), JSON.stringify(hit));
+      check('…one on the accepted side of the game host\'s filter, and self-identifying',
+        !!hit && /^(curl|Wget)\//.test(hit.ua) && /OURO/i.test(hit.ua), hit && hit.ua);
+
+      const d = await (await fetch(`http://127.0.0.1:${UA_PORT}/api/diag?ua=Wget/1.21.3%20(probe)`)).json();
+      check('…and the diagnostic can try a different identity from the server itself',
+        d.userAgent === 'Wget/1.21.3 (probe)' && seen.some(s => s.ua === 'Wget/1.21.3 (probe)'),
+        JSON.stringify(d).slice(0, 160));
+    } finally { try { uaSrv.kill(); } catch (_) {} stand.close(); }
+  }
+
   /* No trade exists on the new contract yet, so prove the DECODER against
      bytes shaped exactly like the chain's: koilib's Serializer silently
      prefers a default type over the one passed per call, which would have

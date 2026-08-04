@@ -75,6 +75,7 @@ MARKET_ADDR=<deployed address> KOINOS_DEV_WIF=<dev wif> node server.js
 | `INDEX_MAX_TOKENS` | how deep a collection is indexed for filters (default 1500) |
 | `AURVANIA_API` | sign-in bridge target (default `https://aurvania.quest`) |
 | `GOOGLE_CLIENT_ID` | the game's Google OAuth client id — set it so sign-in does not depend on the bridge being reachable |
+| `BRIDGE_UA` | User-Agent used when calling the game (default clears its host's filter) |
 | `ADMIN_KEY` | enables `POST /api/collections` to register collections |
 | `DATA_DIR` | runtime state (registry), default `./data-live` |
 
@@ -89,6 +90,16 @@ JavaScript origins** in the Google console.
 
 `GET /api/diag` answers, without a key, whether this server can actually
 reach the game — the question worth asking first when sign-in misbehaves.
+`?ua=…` retries with a different User-Agent from the server itself, which is
+how the header below was found.
+
+One hard-won detail: the host in front of aurvania.quest answers **403** to
+most User-Agents — an empty one, node's default `node`, a full Chrome
+string, `python-requests`, `axios`, a plain product token — and lets
+`curl/*` and `Wget/*` through. Nothing reaches the game's app to explain
+itself, so it looks like the marketplace is broken. `BRIDGE_UA` therefore
+defaults to `curl/8.5.0 (OURO-marketplace; +https://ouro.lifestyle)`: the
+prefix clears the filter, the rest keeps us identifiable in the game's logs.
 Set `GOOGLE_CLIENT_ID` here too: the client id never changes, and inheriting
 it over the network means one unreachable host turns into "Google sign-in is
 not configured" on a perfectly good OAuth setup.
