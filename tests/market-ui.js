@@ -98,6 +98,49 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('…and email, promising the same wallet as the game', /same wallet/i.test(t4), 'promise missing');
   await page.screenshot({ path: `${SCRATCH}/mk-4-connect.png` });
 
+  /* The Google control is ours to look at and Google's to click. Only
+     Google's iframe may open the popup and it cannot be styled, so our
+     button is the face and Google's lands invisibly on top — which is worth
+     nothing unless it actually covers the face. GSI can never load in this
+     sandbox, so stand in for it with an element the size Google renders and
+     measure where a click would land. */
+  const g = await page.evaluate(() => {
+    const face = document.querySelector('.g-face');
+    const kondor = document.querySelector('#w-kondor');
+    const cs = (el) => { const s = getComputedStyle(el); return { h: Math.round(el.getBoundingClientRect().height), r: s.borderRadius, fs: s.fontSize, bg: s.backgroundColor, pe: s.pointerEvents }; };
+    return { face: cs(face), kondor: cs(kondor), mark: !!face.querySelector('svg.g-mark'), text: face.innerText.trim() };
+  });
+  check('Google wears our button, not a stock Google widget',
+    g.mark && /Sign in with Google/i.test(g.text), g.text);
+  check('…sized and styled exactly like the Kondor button beside it',
+    g.face.h === g.kondor.h && g.face.r === g.kondor.r && g.face.fs === g.kondor.fs && g.face.bg === g.kondor.bg,
+    JSON.stringify(g));
+  check('…and never eats the click itself', g.face.pe === 'none', g.face.pe);
+
+  const cover = await page.evaluate(() => {
+    const slot = document.querySelector('#w-google-slot');
+    const wrap = document.querySelector('#w-google-wrap');
+    const r = wrap.getBoundingClientRect();
+    // Google renders an iframe of the asked-for width, ~44px tall.
+    const fake = document.createElement('div');
+    fake.style.cssText = `width:${Math.round(r.width)}px;height:44px`;
+    slot.appendChild(fake);
+    const at = (x, y) => { const el = document.elementFromPoint(x, y); return !!(el && slot.contains(el)); };
+    return {
+      centre: at(r.left + r.width / 2, r.top + r.height / 2),
+      left: at(r.left + 6, r.top + r.height / 2),
+      right: at(r.right - 6, r.top + r.height / 2),
+      top: at(r.left + r.width / 2, r.top + 2),
+      bottom: at(r.left + r.width / 2, r.bottom - 2),
+      slotH: Math.round(slot.getBoundingClientRect().height),
+      wrapH: Math.round(r.height),
+    };
+  });
+  check('the invisible Google button covers our face, so the click reaches Google',
+    cover.centre && cover.left && cover.right && cover.slotH === cover.wrapH, JSON.stringify(cover));
+  check('…right to the top and bottom edges, not just the middle',
+    cover.top && cover.bottom, JSON.stringify(cover));
+
   check('no script errors anywhere', errs.length === 0, errs.slice(0, 2).join(' | '));
 
   console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');

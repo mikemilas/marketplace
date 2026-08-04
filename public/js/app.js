@@ -51,7 +51,18 @@ function connectModal() {
     in the game. Mana fees are on us either way.</p>
     <div class="stack">
       <button class="btn big" id="w-kondor">🦅 Kondor wallet</button>
-      <div id="w-google-slot"></div>
+      <div class="g-wrap" id="w-google-wrap">
+        <button class="btn big g-face" type="button" tabindex="-1" aria-hidden="true">
+          <svg class="g-mark" viewBox="0 0 48 48" aria-hidden="true">
+            <path fill="#4285F4" d="M45.12 24.5c0-1.56-.14-3.06-.4-4.5H24v8.51h11.84c-.51 2.75-2.06 5.08-4.39 6.64v5.52h7.11c4.16-3.83 6.56-9.47 6.56-16.17z"/>
+            <path fill="#34A853" d="M24 46c5.94 0 10.92-1.97 14.56-5.33l-7.11-5.52c-1.97 1.32-4.49 2.1-7.45 2.1-5.73 0-10.58-3.87-12.31-9.07H4.34v5.7C7.96 41.07 15.4 46 24 46z"/>
+            <path fill="#FBBC05" d="M11.69 28.18C11.25 26.86 11 25.45 11 24s.25-2.86.69-4.18v-5.7H4.34C2.85 17.09 2 20.45 2 24s.85 6.91 2.34 9.88l7.35-5.7z"/>
+            <path fill="#EA4335" d="M24 10.75c3.23 0 6.13 1.11 8.41 3.29l6.31-6.31C34.91 4.18 29.93 2 24 2 15.4 2 7.96 6.93 4.34 14.12l7.35 5.7c1.73-5.2 6.58-9.07 12.31-9.07z"/>
+          </svg>
+          <span>Sign in with Google</span>
+        </button>
+        <div class="g-overlay" id="w-google-slot" aria-label="Sign in with Google"></div>
+      </div>
       <div class="alt">— or email —</div>
       <input id="w-email" type="email" placeholder="email" autocomplete="email">
       <input id="w-pass" type="password" placeholder="password" autocomplete="current-password">
@@ -64,15 +75,22 @@ function connectModal() {
     catch (e) { toast(esc(e.message), 'bad'); }
   };
 
-  /* Google, as a RENDERED button rather than One Tap. The first version
-     called google.accounts.id.prompt(), and One Tap is silently suppressed
-     all the time — third-party cookie settings, a previously dismissed
-     prompt (hours of backoff), private windows — which reads as a button
-     that simply does nothing. The rendered button uses the popup flow and
-     has none of those moods; it is what the game itself ships. */
+  /* Google, as its own RENDERED button rather than One Tap. The first version
+     called google.accounts.id.prompt(), and One Tap is silently suppressed all
+     the time — third-party cookie settings, a previously dismissed prompt
+     (hours of backoff), private windows — which reads as a button that simply
+     does nothing. Only Google's iframe may open the popup and it cannot be
+     styled, so it is stretched invisibly over a button of ours (the pattern
+     the game already ships). */
+  const wrap = m.querySelector('#w-google-wrap');
   const slot = m.querySelector('#w-google-slot');
   const cid = Wallet.cfg.googleClientId;
-  if (cid && window.google?.accounts?.id) {
+  const googleDead = (why) => {
+    if (!wrap.isConnected) return;
+    wrap.classList.add('g-dead');
+    wrap.onclick = () => toast(why, 'bad', 6000);
+  };
+  const renderGoogle = () => {
     window.google.accounts.id.initialize({
       client_id: cid,
       ux_mode: 'popup',
@@ -81,16 +99,30 @@ function connectModal() {
         catch (e) { toast(esc(e.message), 'bad'); }
       },
     });
+    /* Match our face exactly so the invisible hit area covers all of it. */
+    const w = Math.max(200, Math.min(400, Math.round(wrap.getBoundingClientRect().width) || 320));
     window.google.accounts.id.renderButton(slot, {
       theme: 'filled_black', size: 'large', text: 'signin_with',
-      shape: 'rect', logo_alignment: 'left', width: 352,
+      shape: 'rectangular', width: w,
     });
+  };
+  if (!cid) {
+    googleDead('Google sign-in is not configured — use email');
   } else {
-    /* The GIS script did not load (blocked network, extension) or the id is
-       missing — say so instead of presenting a dead control. */
-    slot.innerHTML = '<button class="btn big" id="w-google-dead">Sign in with Google</button>';
-    slot.querySelector('#w-google-dead').onclick = () =>
-      toast(cid ? 'The Google sign-in script could not load — check for blockers, or use email' : 'Google sign-in is not configured — use email', 'bad', 6000);
+    /* The GSI script is async: the modal can open before it lands. Our button
+       is on screen either way, so wait for Google rather than declaring it
+       broken on the first look. */
+    let waited = 0;
+    (function awaitGsi() {
+      if (!wrap.isConnected) return;
+      if (window.google?.accounts?.id) {
+        try { renderGoogle(); }
+        catch (e) { console.warn('Google button failed to render', e); googleDead('Google sign-in could not start — use email'); }
+        return;
+      }
+      if ((waited += 150) > 8000) return googleDead('The Google sign-in script could not load — check for blockers, or use email');
+      setTimeout(awaitGsi, 150);
+    })();
   }
   const emailAction = (action) => async () => {
     const email = m.querySelector('#w-email').value.trim();

@@ -163,6 +163,35 @@ label { display: block; font-size: 13px; color: var(--dim); margin: 12px 0 5px; 
 .modal .linkish { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
 .wallet-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
 
+/* One control height down the stack. Left to themselves these buttons size
+   to their content — an emoji makes a taller line box than plain text, and
+   an icon taller still — so stacked siblings end up a pixel or two apart. */
+.modal .stack .btn.big { min-height: 46px; }
+
+/* Google sign-in. Google's own iframe is the only thing allowed to open the
+   popup, and it cannot be styled — so it is stretched invisibly across a
+   button of ours. Players see OURO's button; the click lands on Google's. */
+.g-wrap { position: relative; cursor: pointer; }
+.g-face {
+  width: 100%; pointer-events: none;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+}
+.g-face .g-mark { width: 17px; height: 17px; flex: none; }
+.g-wrap:hover .g-face, .g-wrap:focus-within .g-face { border-color: var(--accent); }
+.g-wrap:active .g-face { transform: translateY(1px); }
+.g-overlay {
+  position: absolute; inset: 0; z-index: 2; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  opacity: .001;
+}
+/* Google's button is a fixed 44px tall and our face is taller, which would
+   leave the top and bottom edges dead. A hair of scale spreads the hit area
+   over the whole face — it is invisible, so nothing distorts on screen, and
+   the overflow clip keeps it inside the button. */
+.g-overlay > * { transform: scale(1.1); }
+/* Google never arrived: the wrap takes the click itself and explains why. */
+.g-wrap.g-dead .g-face { opacity: .75; }
+
 #toasts { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 90; display: flex; flex-direction: column; gap: 8px; width: min(440px, 92vw); }
 .toast {
   background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent);
