@@ -74,6 +74,7 @@ MARKET_ADDR=<deployed address> KOINOS_DEV_WIF=<dev wif> node server.js
 | `SPONSOR_RC_MAX` | absolute per-transaction mana ceiling (default 15 KOIN) |
 | `INDEX_MAX_TOKENS` | how deep a collection is indexed for filters (default 1500) |
 | `AURVANIA_API` | sign-in bridge target (default `https://aurvania.quest`) |
+| `GOOGLE_CLIENT_ID` | the game's Google OAuth client id — set it so sign-in does not depend on the bridge being reachable |
 | `ADMIN_KEY` | enables `POST /api/collections` to register collections |
 | `DATA_DIR` | runtime state (registry), default `./data-live` |
 
@@ -85,6 +86,12 @@ the game. Proven end-to-end in the test suite: register through the
 marketplace, log in at aurvania.quest, same address. For Google sign-in the
 marketplace's domain must be added to the OAuth client's **authorized
 JavaScript origins** in the Google console.
+
+`GET /api/diag` answers, without a key, whether this server can actually
+reach the game — the question worth asking first when sign-in misbehaves.
+Set `GOOGLE_CLIENT_ID` here too: the client id never changes, and inheriting
+it over the network means one unreachable host turns into "Google sign-in is
+not configured" on a perfectly good OAuth setup.
 
 ### The mana sponsor
 

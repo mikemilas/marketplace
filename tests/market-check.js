@@ -64,6 +64,11 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
   check('config names the sponsor payer', cfg.sponsor === true && cfg.sponsorPayer === dev.getAddress(), JSON.stringify(cfg).slice(0, 120));
   check('config carries the Google client id from Aurvania', !!cfg.googleClientId, 'missing');
 
+  const diag = (await api('/api/diag')).body;
+  check('a diagnostic endpoint reports whether the sign-in bridge is reachable',
+    !!diag.bridge && typeof diag.bridge.ok === 'boolean' && !!diag.googleClientId,
+    JSON.stringify(diag).slice(0, 200));
+
   const home = await fetch(`http://127.0.0.1:${PORT}/`);
   const html = await home.text();
   check('the site is served', home.status === 200 && html.includes('OURO'), String(home.status));
@@ -254,6 +259,47 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       check('…and ignores the contract\'s non-trade events rather than choking on them',
         !!body && Array.isArray(body.events) && body.known === 0, JSON.stringify(body));
     } finally { try { live.kill(); } catch (_) {} }
+  }
+
+  /* ---- sign-in must not depend on the game being reachable ----
+     Exactly what went wrong live: the bridge stopped answering, and with
+     it the client id, so the site announced "Google sign-in is not
+     configured" while the OAuth setup was perfectly fine. */
+  {
+    const OFF_PORT = PORT + 2;
+    const off = spawn('node', ['server.js'], {
+      cwd: ROOT,
+      env: Object.assign({}, process.env, {
+        PORT: String(OFF_PORT),
+        DATA_DIR: path.join(SCRATCH, 'mk-off-' + process.pid),
+        KOINOS_NETWORK: 'mainnet',
+        AURVANIA_API: 'http://127.0.0.1:9',        // nothing listens here
+        GOOGLE_CLIENT_ID: '893657214159-test.apps.googleusercontent.com',
+      }),
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    try {
+      let c = null;
+      for (let i = 0; i < 40; i++) {
+        await sleep(400);
+        try { const rr = await fetch(`http://127.0.0.1:${OFF_PORT}/api/config`); if (rr.ok) { c = await rr.json(); break; } } catch (_) {}
+      }
+      check('with the bridge down, the client id still comes from this server\'s env',
+        !!c && c.googleClientId === '893657214159-test.apps.googleusercontent.com', JSON.stringify(c).slice(0, 140));
+
+      const acct = await fetch(`http://127.0.0.1:${OFF_PORT}/api/account`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'login', email: 'a@b.c', password: 'x' }),
+      });
+      const ab = await acct.json();
+      check('…and a failed sign-in says WHAT could not be reached, not just that it failed',
+        acct.status === 502 && !!ab.detail && ab.detail.length > 3, JSON.stringify(ab).slice(0, 160));
+
+      const d = await (await fetch(`http://127.0.0.1:${OFF_PORT}/api/diag`)).json();
+      check('…and the diagnostic names the unreachable bridge',
+        d.bridge && d.bridge.ok === false && !!d.bridge.error && /env/.test(d.googleClientId),
+        JSON.stringify(d).slice(0, 200));
+    } finally { try { off.kill(); } catch (_) {} }
   }
 
   /* No trade exists on the new contract yet, so prove the DECODER against

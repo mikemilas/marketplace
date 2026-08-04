@@ -95,6 +95,9 @@ const CFG = {
   SPONSOR_RC_PER_OP: bigEnv('SPONSOR_RC_PER_OP', 3e8),
   SPONSOR_RC_MAX: bigEnv('SPONSOR_RC_MAX', 15e8),
   AURVANIA_API: (process.env.AURVANIA_API || 'https://aurvania.quest').replace(/\/$/, ''),
+  /* Optional: the same Google OAuth client the game uses. Set it here and
+     sign-in no longer waits on the game server being reachable. */
+  GOOGLE_CLIENT_ID: (process.env.GOOGLE_CLIENT_ID || '').trim(),
   ADMIN_KEY: (process.env.ADMIN_KEY || '').trim(),
 };
 const NET = NETWORKS[CFG.NETWORK] || NETWORKS.mainnet;
@@ -608,13 +611,53 @@ function serveStatic(res, urlPath) {
 
 /* ---------------- api ---------------- */
 
-let aurvaniaInfo = null;
+/* The game's public settings, chiefly the Google client id. This used to be
+   a live cross-site fetch with no fallback, which made a value that never
+   changes depend on one host being reachable from this one — and when that
+   call started failing, sign-in silently advertised itself as "not
+   configured". Now: this server's own env wins, the last good answer is
+   remembered on disk, and the reason for a failure is kept for /api/diag. */
+const GAMEINFO_FILE = path.join(CFG.DATA_DIR, 'gameinfo.json');
+let aurvaniaInfo = loadJson(GAMEINFO_FILE, null);
+let aurvaniaError = null;
+let aurvaniaAt = 0;
+
+async function fetchJson(url, opts = {}, tries = 2) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(opts.timeoutMs || 12000) });
+      const text = await r.text();
+      let body = null;
+      try { body = JSON.parse(text); } catch (_) {}
+      return { ok: r.ok, status: r.status, body, text };
+    } catch (e) {
+      last = e;
+      if (i + 1 < tries) await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  const err = new Error(`${last && last.name === 'TimeoutError' ? 'timed out' : String((last && last.message) || last)}`);
+  err.cause = last;
+  throw err;
+}
+
 async function gameInfo() {
-  if (aurvaniaInfo) return aurvaniaInfo;
+  // Refresh at most every ten minutes; serve the remembered copy meanwhile.
+  if (aurvaniaInfo && Date.now() - aurvaniaAt < 600000) return aurvaniaInfo;
   try {
-    const r = await fetch(CFG.AURVANIA_API + '/api/chain-info', { signal: AbortSignal.timeout(8000) });
-    if (r.ok) aurvaniaInfo = await r.json();
-  } catch (_) {}
+    const r = await fetchJson(CFG.AURVANIA_API + '/api/chain-info');
+    if (r.ok && r.body) {
+      aurvaniaInfo = r.body;
+      aurvaniaError = null;
+      aurvaniaAt = Date.now();
+      try { saveJson(GAMEINFO_FILE, aurvaniaInfo); } catch (_) {}
+    } else {
+      aurvaniaError = `HTTP ${r.status}`;
+    }
+  } catch (e) {
+    aurvaniaError = String((e && e.message) || e).slice(0, 200);
+    if (!aurvaniaInfo) console.error(`[bridge] ${CFG.AURVANIA_API} unreachable — ${aurvaniaError}`);
+  }
   return aurvaniaInfo || {};
 }
 
@@ -633,7 +676,8 @@ const api = {
       explorer: NET.explorer, koin: NET.koinContract,
       market: CFG.MARKET_ADDR || null, feeBps, treasury,
       sponsor: !!dev, sponsorPayer: dev ? dev.getAddress() : null,
-      googleClientId: gi.googleClientId || null,
+      // Our own env first: the bridge is a convenience, not a dependency.
+      googleClientId: CFG.GOOGLE_CLIENT_ID || gi.googleClientId || null,
       aurvania: CFG.AURVANIA_API,
     });
   },
@@ -847,15 +891,46 @@ const api = {
       return json(res, 400, { error: 'Unsupported action' });
     }
     try {
-      const r = await fetch(CFG.AURVANIA_API + '/api/account', {
+      const r = await fetchJson(CFG.AURVANIA_API + '/api/account', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+        body: JSON.stringify(body), timeoutMs: 15000,
       });
-      const data = await r.json();
-      return json(res, r.status, data);
-    } catch (_) {
-      return json(res, 502, { error: 'Could not reach the account server — try again shortly' });
+      return json(res, r.status, r.body || { error: 'The account server sent an unreadable reply' });
+    } catch (e) {
+      /* Say WHAT failed. A bare "could not reach" sent us hunting the
+         browser and the OAuth console when the real answer was that this
+         server cannot open a connection to the game at all. */
+      const detail = String((e && e.message) || e).slice(0, 200);
+      console.error('[bridge] account call failed —', detail);
+      return json(res, 502, {
+        error: 'Could not reach the account server — try again shortly',
+        detail,
+      });
     }
+  },
+
+  /** Is the sign-in bridge actually working? Answers without a key because
+      it exposes nothing but reachability — and being able to ask from
+      outside is the whole point when the site is misbehaving. */
+  async diag(req, res) {
+    const started = Date.now();
+    let reach = null;
+    try {
+      const r = await fetchJson(CFG.AURVANIA_API + '/api/chain-info', { timeoutMs: 12000 }, 1);
+      reach = { ok: r.ok, status: r.status, ms: Date.now() - started, hasClientId: !!(r.body && r.body.googleClientId) };
+    } catch (e) {
+      reach = { ok: false, error: String((e && e.message) || e).slice(0, 200), ms: Date.now() - started };
+    }
+    json(res, 200, {
+      aurvania: CFG.AURVANIA_API,
+      bridge: reach,
+      lastBridgeError: aurvaniaError,
+      googleClientId: CFG.GOOGLE_CLIENT_ID ? 'from this server\'s env' :
+        (aurvaniaInfo && aurvaniaInfo.googleClientId ? 'inherited from the game' : 'MISSING'),
+      remembered: !!aurvaniaInfo,
+      market: CFG.MARKET_ADDR || null,
+      sponsor: !!dev,
+    });
   },
 
   async sponsor(req, res) {
@@ -897,6 +972,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/sponsor') return await api.sponsor(req, res);
     if (p === '/api/balance') return await api.balance(req, res, url.searchParams);
     if (p === '/api/history') return await api.history(req, res, url.searchParams);
+    if (p === '/api/diag') return await api.diag(req, res);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });
     return serveStatic(res, p === '/' ? '/index.html' : p);
   } catch (e) {

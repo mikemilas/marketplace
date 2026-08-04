@@ -78,7 +78,11 @@ const Wallet = (() => {
       body: JSON.stringify(body),
     });
     const data = await r.json();
-    if (!r.ok || !data.wif) throw new Error(data.error || 'Sign-in failed');
+    if (!r.ok || !data.wif) {
+      // The server knows WHY the bridge failed; passing that through beats
+      // sending someone to hunt through browser settings.
+      throw new Error(data.detail ? `${data.error} (${data.detail})` : (data.error || 'Sign-in failed'));
+    }
     return adoptWif(data.wif);
   }
 
