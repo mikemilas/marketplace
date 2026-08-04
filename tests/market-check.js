@@ -235,11 +235,26 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
      so the record count is what separates them. */
   {
     const LIVE_PORT = PORT + 1;
+    const liveDir = path.join(SCRATCH, 'mk-live-' + process.pid);
+    fs.mkdirSync(liveDir, { recursive: true });
+    /* Seed the store with the exact corruption that shipped — one real
+       event written twenty times — so the repair path is exercised, not
+       just the walk that stopped causing it. */
+    const dupRow = {
+      seq: 2, kind: 'listed', tx: '0xdup', at: 1785883140110,
+      collection: RELICS, tokenId: '0xdead', seller: '1Seller', buyer: null,
+      price: '1000000000', fee: null, royalty: null, expires: '0',
+    };
+    // lastSeq -1 so the walk still discovers what is really on chain: this
+    // exercises the repair AND the walk, not one at the expense of the other.
+    fs.writeFileSync(path.join(liveDir, 'history.json'),
+      JSON.stringify({ events: Array.from({ length: 20 }, () => ({ ...dupRow })), lastSeq: -1 }));
+
     const live = spawn('node', ['server.js'], {
       cwd: ROOT,
       env: Object.assign({}, process.env, {
         PORT: String(LIVE_PORT),
-        DATA_DIR: path.join(SCRATCH, 'mk-live-' + process.pid),
+        DATA_DIR: liveDir,
         KOINOS_NETWORK: 'mainnet',
         MARKET_ADDR: '1BsZx4Hc69tWo1q9sXNP9ywvpBW2KdXwc8',
       }),
@@ -255,9 +270,25 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
         } catch (_) {}
       }
       check('the indexer really walks the market contract\'s history on chain',
-        !!body && body.scanned > 0, JSON.stringify(body));
-      check('…and ignores the contract\'s non-trade events rather than choking on them',
-        !!body && Array.isArray(body.events) && body.known === 0, JSON.stringify(body));
+        !!body && body.scanned > 0, JSON.stringify(body).slice(0, 160));
+
+      /* The walk paged over the same records twenty times, because the
+         FIRST record of an account carries no seq_num at all (protobuf
+         omits zero) and every comparison against NaN was false. */
+      check('…in one pass, instead of paging over the same records again and again',
+        !!body && body.scanned <= 10, `scanned ${body && body.scanned}`);
+
+      const rows = (body && body.events) || [];
+      const keys = rows.map(e => [e.seq, e.idx, e.tx, e.kind, e.tokenId, e.price].join('|'));
+      check('…and one event lands as ONE row, however often the walk runs',
+        keys.length === new Set(keys).size, `${keys.length} rows, ${new Set(keys).size} distinct`);
+      check('…with duplicates already on disk collapsed rather than served forever',
+        rows.filter(e => e.tx === '0xdup').length === 1,
+        `${rows.filter(e => e.tx === '0xdup').length} copies of the seeded duplicate`);
+
+      const listed = rows.find(e => e.kind === 'listed' && e.tx !== '0xdup');
+      check('…and the real listing on chain is decoded with its price',
+        !!listed && !!listed.price && !!listed.seller, JSON.stringify(listed || null).slice(0, 160));
     } finally { try { live.kill(); } catch (_) {} }
   }
 

@@ -407,7 +407,32 @@ try {
   console.error('[history] event decoding unavailable —', String((e && e.message) || e));
 }
 
+/* One event, one row. The key has to survive a restart and a re-walk, so
+   it is built from what the chain says rather than from insertion order:
+   the record's sequence plus the event's index within that receipt (a
+   single transaction can emit more than one). */
+const eventKey = (e) => [e.seq, e.idx ?? '', e.tx, e.kind, e.tokenId, e.price].join('|');
+function dedupeEvents(list) {
+  const out = [], seen = new Set();
+  for (const e of list) {
+    const k = eventKey(e);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(e);
+  }
+  return out;
+}
+
 let history = loadJson(HISTORY_FILE, null) || { events: [], lastSeq: -1 };
+// Repair anything an earlier walk duplicated rather than serving it forever.
+if (Array.isArray(history.events)) {
+  const before = history.events.length;
+  history.events = dedupeEvents(history.events);
+  if (history.events.length !== before) {
+    console.log(`[history] collapsed ${before - history.events.length} duplicate row(s)`);
+    try { saveJson(HISTORY_FILE, history); } catch (_) {}
+  }
+}
 /* How many account-history records the last walk actually read. Without
    it, "no trades yet" and "the walk never reached the chain" look
    identical from the outside — including to the tests. */
@@ -435,10 +460,11 @@ async function refreshHistory({ force = false } = {}) {
   if (!force && Date.now() - historyAt < 20000) return history;
   if (historyRun) return historyRun;          // one walk at a time
   historyRun = (async () => {
-    const seen = new Set(history.events.map(e => e.seq));
+    const seen = new Set(history.events.map(eventKey));
     const fresh = [];
     let seq = null;
     let scanned = 0;
+    let lowestSeen = Infinity;
     for (let page = 0; page < 20; page++) {
       const args = { address: CFG.MARKET_ADDR, limit: 100, ascending: false, irreversible: false };
       if (seq !== null) args.seq_num = seq;
@@ -449,35 +475,49 @@ async function refreshHistory({ force = false } = {}) {
       if (!values.length) break;
       scanned += values.length;
       let reachedKnown = false;
+      let pageMin = Infinity;
       for (const v of values) {
-        const n = Number(v.seq_num);
-        if (n <= history.lastSeq || seen.has(n)) { reachedKnown = true; continue; }
+        /* Protobuf omits zero, so the very first record of an account
+           arrives with NO seq_num at all. Reading it as a number gave NaN,
+           every comparison against it was false, and the walk paged over
+           the same records twenty times re-adding what it already had. */
+        const n = Number(v.seq_num || 0);
+        if (n < pageMin) pageMin = n;
+        if (n <= history.lastSeq) { reachedKnown = true; continue; }
         const txId = v.trx?.transaction?.id || null;
-        for (const ev of (v.trx?.receipt?.events || [])) {
+        const evs = v.trx?.receipt?.events || [];
+        for (let i = 0; i < evs.length; i++) {
+          const ev = evs[i];
           const type = EVENT_TYPES[ev.name];
           if (!type) continue;
           let data = null;
           try { data = await marketSerializer.deserialize(utils.decodeBase64url(ev.data), type); }
           catch (_) { continue; }
-          fresh.push({
-            seq: n, kind: EVENT_KIND[ev.name], tx: txId,
+          const row = {
+            seq: n, idx: Number(ev.sequence ?? i), kind: EVENT_KIND[ev.name], tx: txId,
             at: await blockTimeOf(txId),
             collection: data.collection, tokenId: data.token_id,
             seller: data.seller || null, buyer: data.buyer || null,
             price: data.price || null,
             fee: data.protocol_fee || null, royalty: data.royalties_paid || null,
             expires: data.expires || null,
-          });
+          };
+          const key = eventKey(row);
+          if (seen.has(key)) { reachedKnown = true; continue; }
+          seen.add(key);            // within this walk too, not just against what was stored
+          fresh.push(row);
         }
       }
-      const oldest = Number(values[values.length - 1].seq_num);
-      if (reachedKnown || oldest <= 0) break;
-      seq = oldest - 1;
-      if (seq < 0) break;
+      if (reachedKnown || pageMin <= 0) break;
+      const next = pageMin - 1;
+      // Never re-ask for ground already covered — that is how this looped.
+      if (!Number.isFinite(next) || next < 0 || next >= lowestSeen) break;
+      lowestSeen = next;
+      seq = next;
     }
     if (fresh.length) {
-      history.events = [...fresh, ...history.events]
-        .sort((a, b) => b.seq - a.seq)
+      history.events = dedupeEvents([...fresh, ...history.events])
+        .sort((a, b) => b.seq - a.seq || b.idx - a.idx)
         .slice(0, 20000);
       history.lastSeq = Math.max(history.lastSeq, ...fresh.map(e => e.seq));
       try { saveJson(HISTORY_FILE, history); } catch (_) {}
