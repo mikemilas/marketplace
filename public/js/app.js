@@ -1003,21 +1003,55 @@ async function createMint(body, me, info = {}) {
     };
     const toHexId = (str) => '0x' + [...str].map((ch) => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
 
-    /* Matching is the whole game: every JSON entry must find its file, and
-       the person minting sees the tally BEFORE anything is spent. */
+    /* Matching is the whole game — and exact filenames are a desktop
+       luxury. Android's picker hands the browser RENAMED files
+       ("1000012345.png", "1 (1).png"), so match in widening circles:
+       exact name, then name with a duplicate-suffix stripped, then — when
+       nothing matches but the counts agree — pair the two lists in
+       natural order and say so out loud. The tally always shows BEFORE
+       anything is spent. */
+    let matchedFiles = [];   // File per entry, in entry order
+    let matchMode = 'name';
+    const core = (n) => {
+      const b = String(n).split('/').pop().toLowerCase();
+      const noExt = b.replace(/\.[a-z0-9]+$/, '');
+      return noExt.replace(/ \(\d+\)$/, '').replace(/^img[_-]?/, '');
+    };
+    const naturalSort = (a, b) => a.localeCompare(b, undefined, { numeric: true });
     const refresh = () => {
+      matchedFiles = [];
+      matchMode = 'name';
+      const names = [...files.keys()];
       const missing = [];
-      let matched = 0;
       for (const e of entries) {
-        const base = String(e.image || '').split('/').pop().toLowerCase();
-        if (files.has(base)) matched++; else missing.push(base || '(no image field)');
+        const want = String(e.image || '').split('/').pop().toLowerCase();
+        let hit = files.get(want) || null;
+        if (!hit) {
+          const c = core(want);
+          const near = names.find((n) => core(n) === c);
+          if (near) hit = files.get(near);
+        }
+        matchedFiles.push(hit);
+        if (!hit) missing.push(want || '(no image field)');
       }
-      const unused = [...files.keys()].filter((f) => !entries.some((e) => String(e.image || '').split('/').pop().toLowerCase() === f));
+      let matched = matchedFiles.filter(Boolean).length;
+      if (entries.length && matched === 0 && files.size === entries.length) {
+        // Names are a total loss but the counts agree: order carries it.
+        const ordered = names.slice().sort(naturalSort).map((n) => files.get(n));
+        matchedFiles = entries.map((_, i) => ordered[i]);
+        matched = entries.length;
+        matchMode = 'order';
+        missing.length = 0;
+      }
+      const unused = files.size - new Set(matchedFiles.filter(Boolean)).size;
       const bits = [];
-      if (entries.length) bits.push(`<b>${matched}</b> of <b>${entries.length}</b> items matched to images`);
-      else bits.push('waiting for the metadata JSON');
+      if (entries.length) {
+        bits.push(`<b>${matched}</b> of <b>${entries.length}</b> items matched to images${matchMode === 'order'
+          ? ' — <b>paired in order</b>, since your device renamed the files. Check the first item lands on the right art.'
+          : ''}`);
+      } else bits.push('waiting for the metadata JSON');
       if (missing.length) bits.push(`<span style="color:var(--bad)">missing images: ${esc(missing.slice(0, 6).join(', '))}${missing.length > 6 ? '…' : ''}</span>`);
-      if (unused.length) bits.push(`${unused.length} image(s) not named by the JSON are ignored`);
+      if (unused > 0 && matched < entries.length) bits.push(`${unused} image(s) not named by the JSON are ignored`);
       prev.innerHTML = bits.join('<br>');
       go.disabled = !(entries.length && matched === entries.length);
       go.textContent = go.disabled ? 'Mint the drop' : `Mint ${entries.length} NFTs`;
@@ -1054,24 +1088,23 @@ async function createMint(body, me, info = {}) {
       const pid = idPrefix();
       go.disabled = true;
       try {
-        /* Art first — content-addressed, so a retry re-uploads nothing. */
+        /* Art first — content-addressed, so a retry re-uploads nothing,
+           and the same File object dedupes however it was matched. */
         const urls = new Map();
         let n = 0;
-        for (const e of entries) {
-          const base = String(e.image || '').split('/').pop().toLowerCase();
-          if (urls.has(base)) continue;
-          const f = files.get(base);
+        for (const f of matchedFiles) {
+          if (urls.has(f)) continue;
           go.innerHTML = `<span class="spin"></span> Uploading art ${++n}…`;
-          const r = await fetch('/api/upload', { method: 'POST', headers: { 'Content-Type': f.type }, body: f });
+          const r = await fetch('/api/upload', { method: 'POST', headers: { 'Content-Type': f.type || 'image/png' }, body: f });
           const d = await r.json();
-          if (!r.ok || d.error) throw new Error(`${base}: ${d.error || 'upload failed'}`);
-          urls.set(base, d.path || d.url);
+          if (!r.ok || d.error) throw new Error(`${f.name}: ${d.error || 'upload failed'}`);
+          urls.set(f, d.path || d.url);
         }
         const items = entries.map((e, i) => ({
           tokenId: toHexId(`${pid}${String(i + 1).padStart(4, '0')}`),
           name: String(e.name || `${prefix} #${i + 1}`).slice(0, 80),
           description: String(e.description || ''),
-          image: urls.get(String(e.image || '').split('/').pop().toLowerCase()),
+          image: urls.get(matchedFiles[i]),
           attributes: Array.isArray(e.attributes) ? e.attributes : [],
         }));
         go.innerHTML = `<span class="spin"></span> Minting ${items.length} on chain…`;
@@ -1146,6 +1179,19 @@ function paintHeader() {
   Wallet.onChange(() => { paintHeader(); route(); });
   $('#btn-connect').onclick = () => (Wallet.account ? walletModal() : connectModal());
   $('#btn-me').onclick = () => { location.hash = '#/me'; };
+  /* The phone-width popout. Any navigation closes it — including the
+     Create link inside it, whose click is itself a hashchange. */
+  const nav = $('#top-nav');
+  const menuBtn = $('#btn-menu');
+  const closeNav = () => { nav.classList.remove('open'); menuBtn.setAttribute('aria-expanded', 'false'); };
+  menuBtn.onclick = () => {
+    const open = nav.classList.toggle('open');
+    menuBtn.setAttribute('aria-expanded', String(open));
+  };
+  window.addEventListener('hashchange', closeNav);
+  document.addEventListener('click', (e) => {
+    if (!nav.contains(e.target) && e.target !== menuBtn) closeNav();
+  });
   window.addEventListener('hashchange', route);
   route();
 })();

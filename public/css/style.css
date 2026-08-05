@@ -351,3 +351,25 @@ textarea:focus { outline: none; border-color: var(--accent); }
 .trait-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-bottom: 8px; }
 .trait-row .t-x { padding: 8px 12px; color: var(--dim); }
 #mt-addtrait { margin-top: 2px; }
+
+/* ---------- the header on a phone ---------- */
+/* Signed in, the header holds brand + Create + My items + an address chip:
+   more than a phone's width. Squeezing it caused the WHOLE PAGE to scroll
+   sideways, so on small screens the nav folds into a popout instead. */
+.top-nav { display: flex; gap: 10px; }
+.nav-toggle { display: none; }
+@media (max-width: 640px) {
+  .brand-sub { display: none; }
+  .nav-toggle { display: inline-flex; }
+  .top-nav {
+    display: none;
+    position: absolute; top: calc(100% + 6px); right: 12px; z-index: 40;
+    flex-direction: column; gap: 6px; min-width: 160px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 8px; box-shadow: 0 12px 34px rgba(0, 0, 0, .5);
+  }
+  .top-nav.open { display: flex; }
+  .top-nav .btn { width: 100%; }
+}
+/* And whatever else ever overflows, the page itself never pans sideways. */
+body { overflow-x: hidden; }

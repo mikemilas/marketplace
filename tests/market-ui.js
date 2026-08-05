@@ -376,6 +376,47 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const ready = await page.evaluate(() => ({ disabled: document.querySelector('#bk-go').disabled, label: document.querySelector('#bk-go').textContent.trim() }));
     check('…and with every image matched the button arms itself with the count',
       ready.disabled === false && /Mint 2 NFTs/.test(ready.label), JSON.stringify(ready));
+
+    /* Android's picker renames files ("1000012345.png"), which is exactly
+       how a real drop showed "0 of 10 matched" on a phone while the same
+       files matched on desktop. When names are useless but counts agree,
+       order carries it — loudly. */
+    await page.setInputFiles('#bk-files', [
+      { name: '1000012345.png', mimeType: 'image/png', buffer: png },
+      { name: '1000012346.png', mimeType: 'image/png', buffer: png },
+    ]);
+    await page.waitForFunction(() => /paired in order/.test(document.querySelector('#bk-preview')?.innerText || ''), { timeout: 10000 });
+    const renamed = await page.evaluate(() => ({ disabled: document.querySelector('#bk-go').disabled, text: document.querySelector('#bk-preview').innerText }));
+    check('…files renamed by a phone still match, paired in order and saying so',
+      renamed.disabled === false && /2 of 2/.test(renamed.text), JSON.stringify(renamed).slice(0, 160));
+  }
+
+  /* ---- the header on a phone ---- */
+  {
+    const phone = await browser.newPage({ viewport: { width: 390, height: 800 } });
+    await phone.goto(`http://127.0.0.1:${PORT}/#/`, { waitUntil: 'load' });
+    await phone.waitForSelector('.col-card', { timeout: 30000 });
+    await phone.evaluate((addr) => {
+      Object.defineProperty(Wallet, 'account', { get: () => ({ kind: 'hosted', address: addr }), configurable: true });
+      paintHeader();
+    }, '1JtWgDM3tN2zEFUmhMvSJF43dCGRNsJ83m');
+    const m = await phone.evaluate(() => ({
+      overflow: document.documentElement.scrollWidth - window.innerWidth,
+      toggleShown: getComputedStyle(document.querySelector('#btn-menu')).display !== 'none',
+      navHidden: getComputedStyle(document.querySelector('#top-nav')).display === 'none',
+    }));
+    check('signed in on a phone, the page no longer pans sideways', m.overflow <= 0, `overflow ${m.overflow}px`);
+    check('…because the nav folds into a menu button', m.toggleShown && m.navHidden, JSON.stringify(m));
+    await phone.click('#btn-menu');
+    const open = await phone.evaluate(() => {
+      const nav = document.querySelector('#top-nav');
+      const r = nav.getBoundingClientRect();
+      return { shown: getComputedStyle(nav).display !== 'none', onScreen: r.right <= window.innerWidth && r.left >= 0, items: nav.querySelectorAll('.btn:not(.hidden)').length };
+    });
+    check('…which opens a popout holding Create and My items, fully on screen',
+      open.shown && open.onScreen && open.items === 2, JSON.stringify(open));
+    await phone.screenshot({ path: `${SCRATCH}/mk-10-phone.png` });
+    await phone.close();
   }
   await page.screenshot({ path: `${SCRATCH}/mk-9-mint.png` });
 
