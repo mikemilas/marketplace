@@ -757,6 +757,61 @@ async function completeLaunch(address, key, spec) {
   return { initialized, error: initialized ? null : lastError };
 }
 
+/** The collection's own signer, when this launchpad holds its key. */
+function collectionKeyFor(collection) {
+  let keys = {};
+  try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (_) {}
+  const held = keys[collection];
+  if (!held || !held.wif) return null;
+  const key = Signer.fromWif(held.wif);
+  key.provider = provider;
+  return key;
+}
+
+/** Sign ops as the collection, pay as dev, broadcast, wait. */
+async function sendAsCollection(collection, key, ops, rcKoin) {
+  const tx = new Transaction({
+    signer: key, provider,
+    options: { payer: dev.getAddress(), payee: collection, rcLimit: String(Math.round(rcKoin * 1e8)) },
+  });
+  for (const op of ops) await tx.pushOperation(op);
+  await tx.prepare();
+  await tx.sign();
+  await dev.signTransaction(tx.transaction);
+  const send = new Transaction({ provider });
+  send.transaction = tx.transaction;
+  await send.send();
+  await send.wait('byTransactionId', 60000);
+  return send.transaction.id;
+}
+
+/** Collections launched before the mint-authority change refuse their own
+    account. We hold the upgrade key: upload the current binary in place. */
+async function healMintAuthority(collection, key) {
+  await sendAsCollection(collection, key, [{
+    upload_contract: {
+      contract_id: collection,
+      bytecode: utils.encodeBase64url(fs.readFileSync(COLLECTION_WASM)),
+    },
+  }], 80);
+}
+
+/** One mint item, checked. Returns {error} or the cleaned item. */
+function cleanMintItem(raw, i) {
+  const tokenId = String(raw.tokenId || '').trim().toLowerCase();
+  const name = String(raw.name || '').trim();
+  const description = String(raw.description || '').trim().slice(0, 1000);
+  const image = safeImage(raw.image);
+  if (!/^0x[0-9a-f]{2,64}$/.test(tokenId)) return { error: `item ${i + 1}: token id must be hex` };
+  if (name.length < 1 || name.length > 80) return { error: `item ${i + 1}: name must be 1-80 characters` };
+  if (!image) return { error: `item ${i + 1}: artwork is required` };
+  const attributes = (Array.isArray(raw.attributes) ? raw.attributes : [])
+    .slice(0, 24)
+    .map(a => ({ trait_type: String(a.trait_type || '').slice(0, 60), value: String(a.value ?? '').slice(0, 60) }))
+    .filter(a => a.trait_type && a.value);
+  return { tokenId, name, description, image, attributes };
+}
+
 /* ---------------- mana sponsorship ---------------- */
 
 /* The rules that keep the dev wallet safe while it pays for strangers:
@@ -1561,6 +1616,112 @@ const api = {
     }
   },
 
+  /** Bulk mint: a whole drop in one request — names, art and traits per
+      item — server-signed like single free mints, batched five items to a
+      transaction so ten NFTs cost two blocks, not ten. The daily budget is
+      spent per ITEM: a ten-item batch is ten of the day's mints, checked
+      before anything touches the chain so a batch either fits or is
+      refused whole. */
+  async mintBatch(req, res) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+    if (!dev) return json(res, 503, { error: 'Minting is not configured on this server' });
+    if (CFG.MINT_FEE_KOIN > 0) {
+      return json(res, 400, { error: 'Bulk minting is only available while minting is free', external: true });
+    }
+    const body = await readBody(req);
+    const collection = String(body.collection || '').trim();
+    const owner = String(body.owner || '').trim();
+    const rawItems = Array.isArray(body.items) ? body.items : [];
+    if (!isAddr(collection) || !isAddr(owner)) return json(res, 400, { error: 'A collection and an owner are required' });
+    if (!rawItems.length) return json(res, 400, { error: 'No items to mint' });
+    if (rawItems.length > CFG.MINT_PER_DAY_TOTAL) {
+      return json(res, 400, { error: `That is ${rawItems.length} items — the site mints at most ${CFG.MINT_PER_DAY_TOTAL} a day` });
+    }
+
+    const items = [];
+    const seenIds = new Set();
+    for (let i = 0; i < rawItems.length; i++) {
+      const it = cleanMintItem(rawItems[i], i);
+      if (it.error) return json(res, 400, { error: it.error });
+      if (seenIds.has(it.tokenId)) return json(res, 400, { error: `item ${i + 1}: token id ${it.tokenId} repeats within the batch` });
+      seenIds.add(it.tokenId);
+      items.push(it);
+    }
+
+    const remaining = CFG.MINT_PER_DAY_TOTAL - mintsSince(DAY);
+    if (items.length > remaining) {
+      return json(res, 429, { error: `Only ${Math.max(0, remaining)} of today's mint budget remains — this batch needs ${items.length}` });
+    }
+    if (rateLimited('mintbatch-ip:' + clientIp(req), 5, DAY)) {
+      return json(res, 429, { error: 'Too many batches from here today' });
+    }
+
+    const key = collectionKeyFor(collection);
+    if (!key) return json(res, 400, { error: 'This collection was not launched here — mint it from your wallet', external: true });
+    const info = await collectionInfo(collection).catch(() => ({}));
+    if (info.owner !== owner) return json(res, 403, { error: 'Only the collection owner can mint into it' });
+
+    // A batch that half-lands is worse than one that fails whole, so every
+    // id is checked against the chain before the first transaction.
+    const c = nftC(collection);
+    for (const it of items) {
+      try {
+        const existing = (await c.functions.owner_of({ token_id: it.tokenId })).result?.value;
+        if (existing) return json(res, 400, { error: `Token ${it.tokenId} already exists in this collection` });
+      } catch (_) {}
+    }
+
+    const mintC = new Contract({ id: collection, provider, abi: COLLECTION_ABI, signer: key });
+    const origin = publicOrigin(req);
+    const results = [];
+    let healed = false;
+    const CHUNK = 5;
+    try {
+      for (let at = 0; at < items.length; at += CHUNK) {
+        const slice = items.slice(at, at + CHUNK);
+        const ops = [];
+        for (const it of slice) {
+          ops.push(await mintC.encodeOperation({ name: 'mint', args: { to: owner, token_id: it.tokenId } }));
+          ops.push(await mintC.encodeOperation({
+            name: 'set_metadata',
+            args: {
+              token_id: it.tokenId,
+              metadata: JSON.stringify({
+                name: it.name, description: it.description,
+                image: it.image.startsWith('/u/') ? `${origin}${it.image}` : it.image,
+                attributes: it.attributes,
+              }),
+            },
+          }));
+        }
+        let txId;
+        try { txId = await sendAsCollection(collection, key, ops, 3 * ops.length); }
+        catch (e) {
+          if (healed || !/not authorized/i.test(String((e && e.message) || e))) throw e;
+          await healMintAuthority(collection, key);
+          healed = true;
+          txId = await sendAsCollection(collection, key, ops, 3 * ops.length);
+        }
+        for (const it of slice) {
+          mints.items.push({ at: Date.now(), collection, tokenId: it.tokenId, owner });
+          results.push({ tokenId: it.tokenId, name: it.name, tx: txId });
+        }
+        try { saveJson(MINT_LOG, mints); } catch (_) {}
+      }
+    } catch (e) {
+      const detail = String((e && e.message) || e).slice(0, 250);
+      console.error('[mint-batch] failed —', detail);
+      forgetCollection(collection);
+      // Whatever landed, landed: say exactly which, so nothing is re-minted.
+      return json(res, results.length ? 207 : 400, {
+        error: `Stopped after ${results.length} of ${items.length}: ${detail}`,
+        minted: results,
+      });
+    }
+    forgetCollection(collection);
+    json(res, 200, { ok: true, minted: results, collection });
+  },
+
   /** Mint with no wallet signature. Possible because launched collections
       accept their OWN account's authority for mint/set_metadata, and OURO
       holds that key — which it already holds as the upgrade authority, so
@@ -1732,6 +1893,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/launch/submit') return await api.launchSubmit(req, res);
     if (p === '/api/launch/finish') return await api.launchFinish(req, res);
     if (p === '/api/mint') return await api.mint(req, res);
+    if (p === '/api/mint-batch') return await api.mintBatch(req, res);
     if (p === '/api/upload') return await api.upload(req, res);
     if ((m = /^\/u\/([a-f0-9]{8,64}\.(?:png|jpg|gif|webp))$/.exec(p))) return serveUpload(res, m[1]);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });

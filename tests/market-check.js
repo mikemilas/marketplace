@@ -325,6 +325,27 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
   }
 
+  /* ---- bulk minting: refused whole, or fits whole ---- */
+  const twoDucks = [
+    { tokenId: '0x4401', name: 'Duck #1', image: 'https://example.com/1.png', attributes: [{ trait_type: 'Rarity', value: 'Common' }] },
+    { tokenId: '0x4402', name: 'Duck #2', image: 'https://example.com/2.png', attributes: [] },
+  ];
+  r = await api('/api/mint-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ collection: RELICS, owner: user.getAddress(), items: twoDucks }) });
+  check('a batch on a collection not launched here is sent back to the wallet',
+    r.status === 400 && r.body.external === true, JSON.stringify(r.body));
+
+  r = await api('/api/mint-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ collection: RELICS, owner: user.getAddress(), items: [twoDucks[0], twoDucks[0]] }) });
+  check('…a token id repeating within a batch is caught before the chain',
+    r.status === 400 && /repeats/.test(r.body.error || ''), JSON.stringify(r.body));
+
+  r = await api('/api/mint-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ collection: RELICS, owner: user.getAddress(),
+      items: Array.from({ length: 31 }, (_, i) => ({ ...twoDucks[0], tokenId: '0x44' + String(i).padStart(2, '0') })) }) });
+  check('…and a batch larger than a whole day\'s budget is refused outright',
+    r.status === 400 && /at most/.test(r.body.error || ''), JSON.stringify(r.body));
+
   /* ---- a launch transaction must PARSE ----
      The contract upload rode on Buffer.toString('base64url'), which never
      pads — and the node's JSON codec requires padded base64url. The first

@@ -349,6 +349,34 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   });
   check('minting asks for a collection, name, id, description and artwork', mint.fields === 6, JSON.stringify(mint));
   check('…and traits can be added as key/value pairs', mint.traitRows === 1, JSON.stringify(mint));
+
+  /* ---- bulk mint: matched by filename, tallied before anything is spent ---- */
+  check('a bulk drop card is offered while minting is free',
+    await page.evaluate(() => !!document.querySelector('#bulk-card')), 'no bulk card');
+  await page.evaluate(() => {
+    document.querySelector('#bk-paste').value = JSON.stringify([
+      { image: '1.png', attributes: [{ trait_type: 'Rarity', value: 'Common' }] },
+      { image: '2.png', attributes: [] },
+    ]);
+    document.querySelector('#bk-paste').dispatchEvent(new Event('input'));
+  });
+  await page.waitForFunction(() => /missing images/.test(document.querySelector('#bk-preview')?.innerText || ''), { timeout: 10000 });
+  check('…JSON without its images names the missing files and stays disarmed',
+    await page.evaluate(() => document.querySelector('#bk-go').disabled), 'button enabled with missing art');
+
+  {
+    // Hand it the files and the tally must flip to ready. (Nothing gets
+    // clicked, so the bytes only need a NAME — matching is by filename.)
+    const png = Buffer.from('89504e470d0a1a0a', 'hex');
+    await page.setInputFiles('#bk-files', [
+      { name: '1.png', mimeType: 'image/png', buffer: png },
+      { name: '2.png', mimeType: 'image/png', buffer: png },
+    ]);
+    await page.waitForFunction(() => /2<\/b> of <b>2/.test(document.querySelector('#bk-preview')?.innerHTML || ''), { timeout: 10000 });
+    const ready = await page.evaluate(() => ({ disabled: document.querySelector('#bk-go').disabled, label: document.querySelector('#bk-go').textContent.trim() }));
+    check('…and with every image matched the button arms itself with the count',
+      ready.disabled === false && /Mint 2 NFTs/.test(ready.label), JSON.stringify(ready));
+  }
   await page.screenshot({ path: `${SCRATCH}/mk-9-mint.png` });
 
   check('no script errors anywhere', errs.length === 0, errs.slice(0, 2).join(' | '));

@@ -173,7 +173,14 @@ re-read the chain.
   authority while the CREATOR owns the collection (mint, metadata,
   royalties). Keys are written 0600, returned by no endpoint, logged nowhere.
 * **Mint** — mints to your wallet and writes the metadata on chain in one
-  transaction, traits included. Free mints need **no wallet signature**: a
+  transaction, traits included. **Bulk mint** takes a whole drop at once:
+  select the images and the drop's metadata JSON — an array of
+  `{"image": "1.png", "attributes": [...]}` entries, names optional — and
+  items are matched to files by name, tallied on screen, then minted
+  server-signed in chunks of five per transaction. A batch spends the daily
+  mint budget per item and either fits whole or is refused whole; if a chunk
+  fails mid-drop the response lists exactly what minted so nothing is
+  minted twice. Free mints need **no wallet signature**: a
   launched collection accepts its own account's authority for
   mint/set_metadata, and OURO holds that key already (it is the upgrade
   authority — strictly stronger, so no new trust). The server mints as the

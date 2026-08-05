@@ -902,7 +902,28 @@ async function createMint(body, me, info = {}) {
       Mana is on us. ${fee > 0
         ? 'Your wallet signs once, to pay the fee.'
         : 'Free mints need no signature at all.'}${Number.isFinite(left) ? ` ${left} of the site's daily mints remain.` : ''}</div>
-    </div>`;
+    </div>
+
+    ${fee === 0 ? `
+    <div class="form-card" style="margin-top:18px" id="bulk-card">
+      <h3>Bulk mint a drop</h3>
+      <p class="sub">A whole set at once: pick every image, then the metadata JSON that
+      describes them — an array of <span class="mono">{"image": "1.png", "attributes": […]}</span>
+      entries, names optional. Items are matched to images by filename.</p>
+      <label for="bk-col">Collection</label>
+      <select id="bk-col">${mine.map((c) => `<option value="${c.address}">${esc(c.name || c.address)}</option>`).join('')}</select>
+      <label for="bk-prefix">Name prefix — items become "Prefix #1", "Prefix #2"… unless the JSON names them</label>
+      <input id="bk-prefix" maxlength="40" placeholder="Duck">
+      <label for="bk-files">Images</label>
+      <input id="bk-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp">
+      <label for="bk-json">Metadata JSON — pick the file or paste it</label>
+      <input id="bk-json" type="file" accept=".json,application/json">
+      <textarea id="bk-paste" rows="3" placeholder='[{"image":"1.png","attributes":[{"trait_type":"Rarity","value":"Common"}]}]'></textarea>
+      <div id="bk-preview" class="fee-note"></div>
+      <button class="btn primary big" id="bk-go" disabled>Mint the drop</button>
+      <div class="fee-note">Free bulk mints need no signature. Each item spends one of the
+      site's daily mints${Number.isFinite(left) ? ` (${left} left today)` : ''}.</div>
+    </div>` : ''}`;
   const art = wireArt('mt-img');
   const traits = $('#mt-traits');
   const addTrait = () => {
@@ -967,6 +988,113 @@ async function createMint(body, me, info = {}) {
       btn.disabled = false; btn.textContent = fee > 0 ? `Mint for ${fee} KOIN` : 'Mint it';
     }
   };
+
+  /* ---- the drop ---- */
+  const bulk = $('#bulk-card');
+  if (bulk) {
+    let files = new Map();     // basename -> File
+    let entries = [];          // parsed metadata
+    const prev = $('#bk-preview');
+    const go = $('#bk-go');
+
+    const idPrefix = () => {
+      const raw = ($('#bk-prefix').value.trim() || 'ITEM').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      return (raw || 'ITEM').slice(0, 12);
+    };
+    const toHexId = (str) => '0x' + [...str].map((ch) => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+
+    /* Matching is the whole game: every JSON entry must find its file, and
+       the person minting sees the tally BEFORE anything is spent. */
+    const refresh = () => {
+      const missing = [];
+      let matched = 0;
+      for (const e of entries) {
+        const base = String(e.image || '').split('/').pop().toLowerCase();
+        if (files.has(base)) matched++; else missing.push(base || '(no image field)');
+      }
+      const unused = [...files.keys()].filter((f) => !entries.some((e) => String(e.image || '').split('/').pop().toLowerCase() === f));
+      const bits = [];
+      if (entries.length) bits.push(`<b>${matched}</b> of <b>${entries.length}</b> items matched to images`);
+      else bits.push('waiting for the metadata JSON');
+      if (missing.length) bits.push(`<span style="color:var(--bad)">missing images: ${esc(missing.slice(0, 6).join(', '))}${missing.length > 6 ? '…' : ''}</span>`);
+      if (unused.length) bits.push(`${unused.length} image(s) not named by the JSON are ignored`);
+      prev.innerHTML = bits.join('<br>');
+      go.disabled = !(entries.length && matched === entries.length);
+      go.textContent = go.disabled ? 'Mint the drop' : `Mint ${entries.length} NFTs`;
+    };
+
+    const adoptJson = (text) => {
+      try {
+        let d = JSON.parse(text);
+        if (d && Array.isArray(d.items)) d = d.items;
+        if (!Array.isArray(d) || !d.length) throw new Error('expected a JSON array of items');
+        entries = d.slice(0, 100);
+        refresh();
+      } catch (e) { entries = []; prev.innerHTML = `<span style="color:var(--bad)">Could not read that JSON: ${esc(e.message)}</span>`; go.disabled = true; }
+    };
+
+    $('#bk-files').onchange = () => {
+      files = new Map([...$('#bk-files').files].map((f) => [f.name.toLowerCase(), f]));
+      refresh();
+    };
+    $('#bk-json').onchange = async () => {
+      const f = $('#bk-json').files && $('#bk-json').files[0];
+      if (f) adoptJson(await f.text());
+    };
+    let pasteTimer;
+    $('#bk-paste').oninput = () => {
+      clearTimeout(pasteTimer);
+      pasteTimer = setTimeout(() => { if ($('#bk-paste').value.trim()) adoptJson($('#bk-paste').value); }, 300);
+    };
+
+    go.onclick = async () => {
+      if (!Wallet.account) return connectModal();
+      const collection = $('#bk-col').value;
+      const prefix = $('#bk-prefix').value.trim() || 'Item';
+      const pid = idPrefix();
+      go.disabled = true;
+      try {
+        /* Art first — content-addressed, so a retry re-uploads nothing. */
+        const urls = new Map();
+        let n = 0;
+        for (const e of entries) {
+          const base = String(e.image || '').split('/').pop().toLowerCase();
+          if (urls.has(base)) continue;
+          const f = files.get(base);
+          go.innerHTML = `<span class="spin"></span> Uploading art ${++n}…`;
+          const r = await fetch('/api/upload', { method: 'POST', headers: { 'Content-Type': f.type }, body: f });
+          const d = await r.json();
+          if (!r.ok || d.error) throw new Error(`${base}: ${d.error || 'upload failed'}`);
+          urls.set(base, d.path || d.url);
+        }
+        const items = entries.map((e, i) => ({
+          tokenId: toHexId(`${pid}${String(i + 1).padStart(4, '0')}`),
+          name: String(e.name || `${prefix} #${i + 1}`).slice(0, 80),
+          description: String(e.description || ''),
+          image: urls.get(String(e.image || '').split('/').pop().toLowerCase()),
+          attributes: Array.isArray(e.attributes) ? e.attributes : [],
+        }));
+        go.innerHTML = `<span class="spin"></span> Minting ${items.length} on chain…`;
+        const r = await fetch('/api/mint-batch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ collection, owner: Wallet.account.address, items }),
+        });
+        const d = await r.json();
+        if (r.status === 207) {
+          toast(`${esc(d.error)} — the ${d.minted.length} that minted are safe`, 'bad', 12000);
+          location.hash = '#/c/' + collection;
+          return;
+        }
+        if (!r.ok || d.error) throw new Error(d.error || 'Bulk mint failed');
+        toast(`🎉 ${d.minted.length} NFTs minted`, 'good', 8000);
+        location.hash = '#/c/' + collection;
+      } catch (e) {
+        toast(esc(e.message), 'bad', 10000);
+        go.disabled = false;
+        refresh();
+      }
+    };
+  }
 }
 
 async function meView() {
