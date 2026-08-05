@@ -705,6 +705,35 @@ async function initializeCollection(address, key, spec) {
   return transaction.id;
 }
 
+
+/** Everything after the contract is on chain: name it, hand it over,
+    keep its key, and put it on the site. Shared by both launch paths. */
+async function completeLaunch(address, key, spec) {
+  let initialized = false;
+  let lastError = null;
+  for (let attempt = 0; attempt < 3 && !initialized; attempt++) {
+    try { await initializeCollection(address, key, spec); initialized = true; }
+    catch (e) {
+      lastError = String((e && e.message) || e).slice(0, 300);
+      console.error('[launch] initialize attempt failed —', lastError);
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+  }
+  rememberCollectionKey(address, key.getPrivateKey('wif', true), spec.owner);
+  launches.items.push({ address, owner: spec.owner, at: Date.now(), initialized });
+  try { saveJson(LAUNCH_LOG, launches); } catch (_) {}
+  if (!registry.collections.some(c => c.address === address)) {
+    registry.collections.push({
+      address, name: spec.name, description: spec.description,
+      image: spec.image || '', featured: false, addedBy: spec.owner,
+      addedAt: Date.now(), launched: true,
+    });
+    saveJson(REGISTRY_FILE, registry);
+  }
+  caches.delete('info:' + address);
+  return { initialized, error: initialized ? null : lastError };
+}
+
 /* ---------------- mana sponsorship ---------------- */
 
 /* The rules that keep the dev wallet safe while it pays for strangers:
@@ -1275,13 +1304,36 @@ const api = {
       },
     });
 
+    /* PAYEE is the collection's own account, not the creator's wallet.
+       The payee is whose nonce a transaction spends, and the chain makes
+       the payee sign — which is the only reason a free launch was ever
+       asking anyone to approve anything. A brand new account signs for
+       itself here, so the creator's wallet is involved when, and only
+       when, it is being asked to part with money. */
     const tx = new Transaction({
       signer: key, provider,
-      options: { payer: dev.getAddress(), payee: v.owner, rcLimit: String(80e8) },
+      options: { payer: dev.getAddress(), payee: address, rcLimit: String(80e8) },
     });
     for (const op of ops) await tx.pushOperation(op);
     await tx.prepare();
     await tx.sign();                     // the collection account authorizes its own upload
+
+    if (CFG.LAUNCH_FEE_KOIN <= 0) {
+      // Nothing here belongs to the creator, so nothing needs their key.
+      try {
+        await dev.signTransaction(tx.transaction);
+        const send = new Transaction({ provider });
+        send.transaction = tx.transaction;
+        await send.send();
+        await send.wait('byTransactionId', 60000);
+      } catch (e) {
+        const detail = String((e && e.message) || e).slice(0, 250);
+        console.error('[launch] free deploy rejected —', detail);
+        return json(res, 400, { error: `The collection could not be deployed: ${detail}` });
+      }
+      const done = await completeLaunch(address, key, v);
+      return json(res, 200, { ok: true, launched: true, collection: address, ...done });
+    }
 
     pendingLaunches.set(tx.transaction.id, {
       at: Date.now(), wif: key.getPrivateKey('wif', true), address,
@@ -1363,35 +1415,9 @@ const api = {
     /* Named and handed over. Separate transaction because the contract has
        to exist before it can be called; we hold the key, so a failure here
        is retryable rather than lost. */
-    const spec = pending.spec;
-    let initialized = false;
-    let lastInitError = null;
-    for (let attempt = 0; attempt < 3 && !initialized; attempt++) {
-      try {
-        await initializeCollection(pending.address, key, spec);
-        initialized = true;
-      } catch (e) {
-        lastInitError = String((e && e.message) || e).slice(0, 300);
-        console.error('[launch] initialize attempt failed —', lastInitError);
-        await new Promise((r) => setTimeout(r, 4000));
-      }
-    }
+    const { initialized, error: lastInitError } = await completeLaunch(pending.address, key, pending.spec);
 
-    rememberCollectionKey(pending.address, pending.wif, spec.owner);
-    launches.items.push({ address: pending.address, owner: spec.owner, at: Date.now(), initialized });
-    try { saveJson(LAUNCH_LOG, launches); } catch (_) {}
-
-    if (!registry.collections.some(c => c.address === pending.address)) {
-      registry.collections.push({
-        address: pending.address, name: spec.name, description: spec.description,
-        image: spec.image || '', featured: false, addedBy: spec.owner, addedAt: Date.now(),
-        launched: true,
-      });
-      saveJson(REGISTRY_FILE, registry);
-    }
-    caches.delete('info:' + pending.address);
-
-    json(res, 200, { ok: true, collection: pending.address, initialized, error: initialized ? null : lastInitError });
+    json(res, 200, { ok: true, collection: pending.address, initialized, error: lastInitError });
   },
 
 

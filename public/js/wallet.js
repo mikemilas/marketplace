@@ -237,6 +237,11 @@ const Wallet = (() => {
     })).json();
     if (prep.error) throw new Error(prep.error);
 
+    /* A free launch is finished by the time this returns: nothing in it
+       belongs to you, so nothing needed your key. Only a FEE requires a
+       signature, because only you can authorize spending your KOIN. */
+    if (prep.launched) return prep;
+
     const tx = new Transaction({ signer: account.signer, provider });
     tx.transaction = prep.transaction;
     await tx.sign();

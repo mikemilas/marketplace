@@ -822,9 +822,11 @@ function createLaunch(body, me, info) {
       <div class="breakdown" id="lc-break"></div>
       <button class="btn primary big" id="lc-go"${info.ready === false ? ' disabled' : ''}>
         ${fee > 0 ? `Launch for ${fee} KOIN` : 'Launch collection'}</button>
-      <div class="fee-note">Deploying takes a few seconds. Your wallet signs once: that
-      signature pays the fee and authorizes the deployment together, so one cannot
-      happen without the other.</div>
+      <div class="fee-note">Deploying takes a few seconds. ${fee > 0
+        ? `Your wallet signs once, to pay the fee — the deployment itself is ours to
+           authorize, and rides in the same transaction so one cannot happen without
+           the other.`
+        : 'Launching is free right now, so your wallet is not asked to sign anything at all.'}</div>
     </div>`;
   const art = wireArt('lc-img');
   const brk = $('#lc-break');
