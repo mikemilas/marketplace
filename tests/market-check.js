@@ -46,6 +46,7 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       MARKET_ADDR: MARKET,
       KOINOS_DEV_WIF: dev.getPrivateKey('wif', true),
       ADMIN_KEY: 'test-admin-key',
+      LAUNCH_FEE_KOIN: '0',
     }),
     stdio: process.env.KC_TEST_STDIO ? 'inherit' : ['ignore', 'ignore', 'ignore'],
   });
@@ -302,6 +303,24 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       check('…and the real listing on chain is decoded with its price',
         !!listed && !!listed.price && !!listed.seller, JSON.stringify(listed || null).slice(0, 160));
     } finally { try { live.kill(); } catch (_) {} }
+  }
+
+  /* ---- a launch transaction must PARSE ----
+     The contract upload rode on Buffer.toString('base64url'), which never
+     pads — and the node's JSON codec requires padded base64url. The first
+     binary was divisible by 3 (padded == unpadded) and deployed twice on
+     that coincidence; the rebuild broke it and every launch died with
+     "parameters could not be parsed". With a zero-mana payer the node
+     parses BEFORE it checks resources, so the free path must die at the
+     MANA wall — dying at the parser is this exact bug back again. */
+  {
+    r = await api('/api/launch/prepare', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Parse Probe', symbol: 'PROBE', description: '', owner: user.getAddress() }),
+    });
+    const msg = String((r.body && r.body.error) || '');
+    check('a free launch reaches the mempool whole (dies at mana, never at the parser)',
+      r.status === 400 && /resource|rc|mana/i.test(msg) && !/parsed|translate/i.test(msg), JSON.stringify(r.body).slice(0, 200));
   }
 
   /* ---- sign-in must not depend on the game being reachable ----

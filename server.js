@@ -1299,8 +1299,13 @@ const api = {
     ops.push({
       upload_contract: {
         contract_id: address,
-        // base64URL: koilib rejects the '+' and '/' of plain base64.
-        bytecode: fs.readFileSync(COLLECTION_WASM).toString('base64url'),
+        /* koilib's own encoder, NOT Buffer.toString('base64url'): the node's
+           JSON codec wants PADDED base64url, and Node never pads. The first
+           contract binary was 75,936 bytes — divisible by 3, so unpadded and
+           padded are the same string — and deployed twice on that pure
+           coincidence. The rebuild changed the length by 31 bytes and every
+           launch since died with "parameters could not be parsed". */
+        bytecode: utils.encodeBase64url(fs.readFileSync(COLLECTION_WASM)),
       },
     });
 
@@ -1477,7 +1482,8 @@ const api = {
         await up.pushOperation({
           upload_contract: {
             contract_id: address,
-            bytecode: fs.readFileSync(COLLECTION_WASM).toString('base64url'),
+            // Padded, via koilib — see launchPrepare for the hard-won why.
+            bytecode: utils.encodeBase64url(fs.readFileSync(COLLECTION_WASM)),
           },
         });
         await up.prepare();
