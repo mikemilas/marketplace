@@ -1321,14 +1321,43 @@ const api = {
     const key = Signer.fromWif(pending.wif);
     key.provider = provider;
 
+    /* Rebuild from the four fields the protocol defines rather than
+       forwarding the object the browser handed back. The transaction we
+       BUILT here deploys fine; the one that returns through a browser
+       round trip was being refused with "parameters could not be parsed",
+       which is the node rejecting the request shape — anything koilib
+       attached client-side rides along in that JSON otherwise. */
+    const clean = {
+      id: signed.id,
+      header: signed.header,
+      operations: signed.operations,
+      signatures: signed.signatures,
+    };
+
     try {
-      await dev.signTransaction(signed);          // payer
+      await dev.signTransaction(clean);           // payer
       const tx = new Transaction({ provider });
-      tx.transaction = signed;
+      tx.transaction = clean;
       await tx.send();
       await tx.wait('byTransactionId', 60000);
     } catch (e) {
-      return json(res, 400, { error: `The collection could not be deployed: ${String((e && e.message) || e).slice(0, 200)}` });
+      const detail = String((e && e.message) || e).slice(0, 250);
+      // If the shape is still wrong, say what was in it — guessing costs
+      // the creator a fee and 59 KOIN of mana per attempt.
+      console.error('[launch] deploy rejected —', detail,
+        '| tx keys:', Object.keys(signed).join(','),
+        '| header keys:', Object.keys(signed.header || {}).join(','),
+        '| ops:', (signed.operations || []).map(o => Object.keys(o)[0]).join(','),
+        '| sigs:', (signed.signatures || []).length);
+      return json(res, 400, {
+        error: `The collection could not be deployed: ${detail}`,
+        sent: {
+          txKeys: Object.keys(signed),
+          headerKeys: Object.keys(signed.header || {}),
+          ops: (signed.operations || []).map(o => Object.keys(o)[0]),
+          signatures: (signed.signatures || []).length,
+        },
+      });
     }
 
     /* Named and handed over. Separate transaction because the contract has

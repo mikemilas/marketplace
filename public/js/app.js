@@ -856,7 +856,10 @@ function createLaunch(body, me, info) {
       toast(r.initialized ? '🎉 Your collection is live' : 'Deployed — finishing setup…', 'good', 8000);
       location.hash = '#/c/' + r.collection;
     } catch (e) {
-      toast(esc(e.message), 'bad', 9000);
+      /* A failed launch still costs the fee and the mana, so the reason
+         goes on screen in full rather than into a log nobody can reach. */
+      toast(esc(e.message), 'bad', 15000);
+      if (e.sent) console.error('launch payload shape:', e.sent);
       btn.disabled = false; btn.textContent = fee > 0 ? `Launch for ${fee} KOIN` : 'Launch collection';
     }
   };

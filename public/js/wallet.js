@@ -245,7 +245,11 @@ const Wallet = (() => {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transaction: tx.transaction }),
     })).json();
-    if (done.error) throw new Error(humanError(done.error));
+    if (done.error) {
+      const err = new Error(humanError(done.error));
+      err.sent = done.sent;      // the shape the chain refused, for the console
+      throw err;
+    }
     return done;
   }
 
