@@ -132,6 +132,11 @@ const CFG = {
   LAUNCH_FEE_KOIN: Math.max(0, Number(process.env.LAUNCH_FEE_KOIN ?? 100)),
   LAUNCH_PER_DAY_PER_ACCOUNT: parseInt(process.env.LAUNCH_PER_DAY_PER_ACCOUNT || '3', 10),
   LAUNCH_PER_DAY_TOTAL: parseInt(process.env.LAUNCH_PER_DAY_TOTAL || '12', 10),
+  /* Minting, same shape as launching: a configurable fee (0 = free), and
+     a GLOBAL daily budget across every collection — a mint is ~2 KOIN of
+     sponsored mana, so the budget bounds the worst day at ~60 KOIN. */
+  MINT_FEE_KOIN: Math.max(0, Number(process.env.MINT_FEE_KOIN ?? 0)),
+  MINT_PER_DAY_TOTAL: parseInt(process.env.MINT_PER_DAY_TOTAL || '30', 10),
   UPLOAD_MAX_BYTES: parseInt(process.env.UPLOAD_MAX_BYTES || String(4 * 1024 * 1024), 10),
 };
 const NET = NETWORKS[CFG.NETWORK] || NETWORKS.mainnet;
@@ -631,6 +636,18 @@ function readRaw(req, max) {
   });
 }
 
+/** A collection's read caches, after something changed on chain. The
+    browse grid is served from a ten-minute index; without this, a fresh
+    mint shows on its own token page (a direct read) while the collection
+    page insists it does not exist — exactly the bug that shipped. */
+function forgetCollection(addr) {
+  caches.delete('index:' + addr);
+  caches.delete('info:' + addr);
+  for (const k of [...caches.keys()]) {
+    if (k.startsWith('owned:' + addr + ':')) caches.delete(k);
+  }
+}
+
 const marketCfg = async () => {
   if (!marketC) return {};
   try { return await cached('marketcfg', 300000, async () => (await marketC.functions.get_config({})).result) || {}; }
@@ -642,6 +659,12 @@ const COLLECTION_ABI = sanitizeAbi(loadJson(path.join(__dirname, 'server-abi', '
 const KEYS_FILE = path.join(CFG.DATA_DIR, 'collection-keys.json');
 const LAUNCH_LOG = path.join(CFG.DATA_DIR, 'launches.json');
 let launches = loadJson(LAUNCH_LOG, null) || { items: [] };
+const MINT_LOG = path.join(CFG.DATA_DIR, 'mints.json');
+let mints = loadJson(MINT_LOG, null) || { items: [] };
+function mintsSince(ms) {
+  const t = Date.now();
+  return mints.items.filter(m => t - m.at < ms).length;
+}
 
 /** Upgrade keys, at rest. Written 0600 and read by nothing but this. */
 function rememberCollectionKey(address, wif, owner) {
@@ -797,6 +820,9 @@ async function sponsor(txJson, ip) {
   }
 
   const registered = new Set(registry.collections.map(c => c.address));
+  let sawMint = false;
+  const feeOps = [];
+  const touched = [];
   for (const op of tx.operations) {
     const call = op.call_contract;
     if (!call) return { status: 400, body: { error: 'only contract calls are sponsored' } };
@@ -805,7 +831,30 @@ async function sponsor(txJson, ip) {
     const isMarket = target === CFG.MARKET_ADDR;
     const isApproval = registered.has(target) && APPROVAL_ENTRIES.has(entry);
     const isCreatorOp = registered.has(target) && CREATOR_ENTRIES.has(entry);
+    if (isCreatorOp) touched.push(target);
+    if (entry === NFT_ENTRIES.mint && registered.has(target)) sawMint = true;
+    /* The one KOIN transfer this wallet will ever co-sign: the mint fee,
+       exact amount, straight to the treasury, riding beside the mint it
+       pays for. Anything else on the KOIN contract stays refused. */
+    if (target === NET.koinContract && CFG.MINT_FEE_KOIN > 0) { feeOps.push(op); continue; }
     if (!isMarket && !isApproval && !isCreatorOp) {
+      return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
+    }
+  }
+  if (feeOps.length) {
+    const treasury = (await marketCfg()).treasury;
+    if (feeOps.length > 1 || !sawMint || !isAddr(treasury)) {
+      return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
+    }
+    try {
+      const koinC = new Contract({ id: NET.koinContract, provider, abi: TOKEN_ABI });
+      const dec = await koinC.decodeOperation(feeOps[0]);
+      const want = KOIN_SATS(CFG.MINT_FEE_KOIN).toString();
+      if (dec.name !== 'transfer' || dec.args.to !== treasury ||
+          String(dec.args.value) !== want || dec.args.from !== h.payee) {
+        return { status: 400, body: { error: `The mint fee must be exactly ${CFG.MINT_FEE_KOIN} KOIN to the treasury` } };
+      }
+    } catch (_) {
       return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
     }
   }
@@ -824,6 +873,8 @@ async function sponsor(txJson, ip) {
   await dev.signTransaction(tx);
   try {
     const receipt = await provider.sendTransaction(tx);
+    // A creator just changed their collection; stop serving the old view.
+    for (const addr of new Set(touched)) forgetCollection(addr);
     return { status: 200, body: { ok: true, id: tx.id, receipt: receipt && receipt.receipt } };
   } catch (e) {
     /* Keep the chain's own words in the log — that is where a rejection
@@ -965,6 +1016,7 @@ const api = {
       market: CFG.MARKET_ADDR || null, feeBps, treasury,
       sponsor: !!dev, sponsorPayer: dev ? dev.getAddress() : null,
       // Our own env first: the bridge is a convenience, not a dependency.
+      mintFeeKoin: CFG.MINT_FEE_KOIN,
       googleClientId: CFG.GOOGLE_CLIENT_ID || gi.googleClientId || null,
       aurvania: CFG.AURVANIA_API,
     });
@@ -1251,6 +1303,8 @@ const api = {
       perAccountPerDay: CFG.LAUNCH_PER_DAY_PER_ACCOUNT,
       usedToday: isAddr(who) ? launchesSince(DAY, who) : 0,
       globalRemaining: Math.max(0, CFG.LAUNCH_PER_DAY_TOTAL - launchesSince(DAY, null)),
+      mintFeeKoin: CFG.MINT_FEE_KOIN,
+      mintsRemaining: Math.max(0, CFG.MINT_PER_DAY_TOTAL - mintsSince(DAY)),
       ready: !!dev && fs.existsSync(COLLECTION_WASM),
     });
   },
@@ -1507,6 +1561,122 @@ const api = {
     }
   },
 
+  /** Mint with no wallet signature. Possible because launched collections
+      accept their OWN account's authority for mint/set_metadata, and OURO
+      holds that key — which it already holds as the upgrade authority, so
+      no new trust is created. The token still lands in the owner's wallet;
+      this endpoint only works when the claimed owner IS the on-chain owner.
+      Free mints only: a fee means spending someone's KOIN, and only their
+      wallet can authorize that. */
+  async mint(req, res) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+    if (!dev) return json(res, 503, { error: 'Minting is not configured on this server' });
+    if (CFG.MINT_FEE_KOIN > 0) {
+      return json(res, 400, { error: 'Minting carries a fee right now — sign it from your wallet', external: true });
+    }
+    const body = await readBody(req);
+    const collection = String(body.collection || '').trim();
+    const owner = String(body.owner || '').trim();
+    const tokenId = String(body.tokenId || '').trim().toLowerCase();
+    const name = String(body.name || '').trim();
+    const description = String(body.description || '').trim().slice(0, 1000);
+    const image = safeImage(body.image);
+    if (!isAddr(collection) || !isAddr(owner)) return json(res, 400, { error: 'A collection and an owner are required' });
+    if (!/^0x[0-9a-f]{2,64}$/.test(tokenId)) return json(res, 400, { error: 'Token id must be hex' });
+    if (name.length < 1 || name.length > 80) return json(res, 400, { error: 'Name must be 1-80 characters' });
+    if (!image) return json(res, 400, { error: 'Artwork is required — upload a file or paste a link' });
+    const attributes = (Array.isArray(body.attributes) ? body.attributes : [])
+      .slice(0, 24)
+      .map(a => ({ trait_type: String(a.trait_type || '').slice(0, 60), value: String(a.value ?? '').slice(0, 60) }))
+      .filter(a => a.trait_type && a.value);
+
+    if (mintsSince(DAY) >= CFG.MINT_PER_DAY_TOTAL) {
+      return json(res, 429, { error: `The site-wide budget of ${CFG.MINT_PER_DAY_TOTAL} mints per day is spent — try again tomorrow` });
+    }
+    if (rateLimited('mint-ip:' + clientIp(req), 10, DAY)) {
+      return json(res, 429, { error: 'Too many mints from here today' });
+    }
+
+    let keys = {};
+    try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (_) {}
+    const held = keys[collection];
+    if (!held || !held.wif) {
+      // Not one of ours: their own wallet is the only mint authority.
+      return json(res, 400, { error: 'This collection was not launched here — mint it from your wallet', external: true });
+    }
+
+    // Whoever the chain says owns it is the only person minting into it —
+    // and the only wallet the token can land in.
+    const info = await collectionInfo(collection).catch(() => ({}));
+    if (info.owner !== owner) return json(res, 403, { error: 'Only the collection owner can mint into it' });
+
+    const key = Signer.fromWif(held.wif);
+    key.provider = provider;
+    const meta = JSON.stringify({
+      name, description,
+      image: image.startsWith('/u/') ? `${publicOrigin(req)}${image}` : image,
+      attributes,
+    });
+
+    const buildAndSend = async () => {
+      const c = new Contract({ id: collection, provider, abi: COLLECTION_ABI, signer: key });
+      const mintOp = await c.encodeOperation({ name: 'mint', args: { to: owner, token_id: tokenId } });
+      const metaOp = await c.encodeOperation({ name: 'set_metadata', args: { token_id: tokenId, metadata: meta } });
+      const tx = new Transaction({
+        signer: key, provider,
+        options: { payer: dev.getAddress(), payee: collection, rcLimit: String(6e8) },
+      });
+      await tx.pushOperation(mintOp);
+      await tx.pushOperation(metaOp);
+      await tx.prepare();
+      await tx.sign();
+      await dev.signTransaction(tx.transaction);
+      const send = new Transaction({ provider });
+      send.transaction = tx.transaction;
+      await send.send();
+      await send.wait('byTransactionId', 60000);
+      return send.transaction.id;
+    };
+
+    let txId = null;
+    try {
+      try { txId = await buildAndSend(); }
+      catch (e) {
+        /* Collections launched before the mint-authority change refuse the
+           collection account. We hold the upgrade key, so heal in place —
+           upload the current binary — and mint again. */
+        if (!/not authorized/i.test(String((e && e.message) || e))) throw e;
+        const up = new Transaction({
+          signer: key, provider,
+          options: { payer: dev.getAddress(), payee: collection, rcLimit: String(80e8) },
+        });
+        await up.pushOperation({
+          upload_contract: {
+            contract_id: collection,
+            bytecode: utils.encodeBase64url(fs.readFileSync(COLLECTION_WASM)),
+          },
+        });
+        await up.prepare(); await up.sign();
+        await dev.signTransaction(up.transaction);
+        const send = new Transaction({ provider });
+        send.transaction = up.transaction;
+        await send.send();
+        await send.wait('byTransactionId', 60000);
+        txId = await buildAndSend();
+      }
+    } catch (e) {
+      const detail = String((e && e.message) || e).slice(0, 250);
+      console.error('[mint] failed —', detail);
+      return json(res, 400, { error: `Could not mint: ${detail}` });
+    }
+
+    mints.items.push({ at: Date.now(), collection, tokenId, owner });
+    mints.items = mints.items.filter(m => Date.now() - m.at < 7 * DAY);
+    try { saveJson(MINT_LOG, mints); } catch (_) {}
+    forgetCollection(collection);
+    json(res, 200, { ok: true, tx: txId, collection, tokenId });
+  },
+
   /** Artwork, either uploaded here or linked from anywhere. Uploads are
       content-addressed, so the same picture twice costs one file. */
   async upload(req, res) {
@@ -1561,6 +1731,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/launch/prepare') return await api.launchPrepare(req, res);
     if (p === '/api/launch/submit') return await api.launchSubmit(req, res);
     if (p === '/api/launch/finish') return await api.launchFinish(req, res);
+    if (p === '/api/mint') return await api.mint(req, res);
     if (p === '/api/upload') return await api.upload(req, res);
     if ((m = /^\/u\/([a-f0-9]{8,64}\.(?:png|jpg|gif|webp))$/.exec(p))) return serveUpload(res, m[1]);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });

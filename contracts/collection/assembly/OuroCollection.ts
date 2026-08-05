@@ -83,6 +83,39 @@ export class OuroCollection extends Nft {
   }
 
   /**
+   * Mint a token
+   * @external
+   * @event collections.mint_event nft.mint_args
+   */
+  mint(args: nft.mint_args): void {
+    /* Owner OR the collection's own account. OURO keeps the collection
+       account's key as the upgrade authority — already strictly stronger
+       than mint rights — and this is what lets a FREE mint happen with no
+       wallet signature: the launchpad signs as the collection, on the
+       owner's instruction, and the token still lands in the owner's
+       hands. External wallets keep the plain owner path. */
+    const authorized =
+      System.checkAccountAuthority(this.owner().value!) ||
+      System.checkAccountAuthority(this.contractId);
+    System.require(authorized, "mint not authorized");
+    this._mint(args);
+  }
+
+  /**
+   * Set metadata
+   * @external
+   * @event collections.set_metadata_event nft.metadata_args
+   */
+  set_metadata(args: nft.metadata_args): void {
+    // Same two doors as mint, for the metadata that rides along with one.
+    const authorized =
+      System.checkAccountAuthority(this.owner().value!) ||
+      System.checkAccountAuthority(this.contractId);
+    System.require(authorized, "set_metadata not authorized");
+    this._set_metadata(args);
+  }
+
+  /**
    * Name the collection, set its royalty and hand it to its creator.
    * Callable exactly once, by the collection account itself.
    * @external

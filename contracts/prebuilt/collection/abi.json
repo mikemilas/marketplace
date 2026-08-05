@@ -36,6 +36,24 @@
       "entry-point": "0xbd7f6850",
       "read-only": true
     },
+    "mint": {
+      "argument": "nft.mint_args",
+      "return": "",
+      "description": "Mint a token",
+      "entry_point": 3698268091,
+      "read_only": false,
+      "entry-point": "0xdc6f17bb",
+      "read-only": false
+    },
+    "set_metadata": {
+      "argument": "nft.metadata_args",
+      "return": "",
+      "description": "Set metadata",
+      "entry_point": 1029287705,
+      "read_only": false,
+      "entry-point": "0x3d59af19",
+      "read-only": false
+    },
     "initialize": {
       "argument": "collection.initialize_args",
       "return": "",
@@ -162,15 +180,6 @@
       "entry-point": "0x3b5bb56b",
       "read-only": false
     },
-    "set_metadata": {
-      "argument": "nft.metadata_args",
-      "return": "",
-      "description": "Set metadata",
-      "entry_point": 1029287705,
-      "read_only": false,
-      "entry-point": "0x3d59af19",
-      "read-only": false
-    },
     "approve": {
       "argument": "nft.approve_args",
       "return": "",
@@ -196,15 +205,6 @@
       "entry_point": 670398154,
       "read_only": false,
       "entry-point": "0x27f576ca",
-      "read-only": false
-    },
-    "mint": {
-      "argument": "nft.mint_args",
-      "return": "",
-      "description": "Mint NFT",
-      "entry_point": 3698268091,
-      "read_only": false,
-      "entry-point": "0xdc6f17bb",
       "read-only": false
     }
   },
@@ -734,6 +734,14 @@
     }
   },
   "events": {
+    "collections.mint_event": {
+      "type": "nft.mint_args",
+      "argument": "nft.mint_args"
+    },
+    "collections.set_metadata_event": {
+      "type": "nft.metadata_args",
+      "argument": "nft.metadata_args"
+    },
     "collection.initialized": {
       "type": "collection.initialized_event",
       "argument": "collection.initialized_event"
@@ -746,10 +754,6 @@
       "type": "nft.royalties",
       "argument": "nft.royalties"
     },
-    "collections.set_metadata_event": {
-      "type": "nft.metadata_args",
-      "argument": "nft.metadata_args"
-    },
     "collections.token_approval_event": {
       "type": "nft.approve_args",
       "argument": "nft.approve_args"
@@ -761,10 +765,6 @@
     "collections.transfer_event": {
       "type": "nft.transfer_args",
       "argument": "nft.transfer_args"
-    },
-    "collections.mint_event": {
-      "type": "nft.mint_args",
-      "argument": "nft.mint_args"
     }
   }
 }

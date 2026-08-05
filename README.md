@@ -80,6 +80,8 @@ MARKET_ADDR=<deployed address> KOINOS_DEV_WIF=<dev wif> node server.js
 | `LAUNCH_FEE_KOIN` | cost to launch a collection (default 100; set 0 for free) |
 | `LAUNCH_PER_DAY_PER_ACCOUNT` | launches per wallet per day (default 3) |
 | `LAUNCH_PER_DAY_TOTAL` | launches per day across the site (default 12) |
+| `MINT_FEE_KOIN` | cost to mint an NFT (default 0 — free) |
+| `MINT_PER_DAY_TOTAL` | mints per day across ALL collections (default 30) |
 | `UPLOAD_MAX_BYTES` | largest image accepted (default 4MB) |
 | `DATA_DIR` | runtime state (registry), default `./data-live` |
 
@@ -171,7 +173,16 @@ re-read the chain.
   authority while the CREATOR owns the collection (mint, metadata,
   royalties). Keys are written 0600, returned by no endpoint, logged nowhere.
 * **Mint** — mints to your wallet and writes the metadata on chain in one
-  transaction, traits included.
+  transaction, traits included. Free mints need **no wallet signature**: a
+  launched collection accepts its own account's authority for
+  mint/set_metadata, and OURO holds that key already (it is the upgrade
+  authority — strictly stronger, so no new trust). The server mints as the
+  collection, on the owner's behalf, into the owner's wallet — and only when
+  the requester's address IS the on-chain owner. With `MINT_FEE_KOIN` set,
+  the wallet signs once to pay the fee, which the sponsor verifies is
+  exactly the fee, to the treasury, beside a mint — no other KOIN transfer
+  is ever co-signed. Mints are capped by `MINT_PER_DAY_TOTAL` across the
+  whole site.
 
 An upload costs ~59 KOIN of mana against ~1 for an ordinary call, measured
 on this marketplace's own deployment. Roughly 28 launches would drain the

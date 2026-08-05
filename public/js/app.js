@@ -755,7 +755,7 @@ async function createView(tab) {
 
   const body = $('#cr-body');
   if (tab === 'add') return createAdd(body);
-  if (tab === 'mint') return createMint(body, me);
+  if (tab === 'mint') return createMint(body, me, info);
   return createLaunch(body, me, info);
 }
 
@@ -867,7 +867,9 @@ function createLaunch(body, me, info) {
   };
 }
 
-async function createMint(body, me) {
+async function createMint(body, me, info = {}) {
+  const fee = Number(info.mintFeeKoin ?? (Wallet.cfg && Wallet.cfg.mintFeeKoin) ?? 0);
+  const left = info.mintsRemaining;
   if (!me) { body.innerHTML = '<div class="empty">Connect a wallet to mint.</div>'; connectModal(); return; }
   body.innerHTML = '<div class="loading"><span class="spin"></span> Finding collections you own…</div>';
   const { collections } = await api('/collections');
@@ -895,9 +897,11 @@ async function createMint(body, me) {
       <label>Traits <span class="dim">(optional)</span></label>
       <div id="mt-traits"></div>
       <button class="btn" id="mt-addtrait" type="button">+ Add a trait</button>
-      <button class="btn primary big" id="mt-go"${mine.length ? '' : ' disabled'}>Mint it</button>
+      <button class="btn primary big" id="mt-go"${mine.length ? '' : ' disabled'}>${fee > 0 ? `Mint for ${fee} KOIN` : 'Mint it'}</button>
       <div class="fee-note">The NFT is minted to your wallet with its metadata written on chain.
-      Mana is on us.</div>
+      Mana is on us. ${fee > 0
+        ? 'Your wallet signs once, to pay the fee.'
+        : 'Free mints need no signature at all.'}${Number.isFinite(left) ? ` ${left} of the site's daily mints remain.` : ''}</div>
     </div>`;
   const art = wireArt('mt-img');
   const traits = $('#mt-traits');
@@ -932,11 +936,23 @@ async function createMint(body, me) {
     const btn = $('#mt-go');
     btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Minting…';
     try {
-      await Wallet.mintToken(collection, tokenId, {
+      const meta = {
         name, description: $('#mt-desc').value.trim(),
         image: image.startsWith('/u/') ? location.origin + image : image,
         attributes,
-      });
+      };
+      if (fee === 0) {
+        /* Server-signed: the collection mints as itself, so nothing needs
+           your key. Collections not launched here fall back to the wallet. */
+        try {
+          await Wallet.serverMint({ collection, tokenId, name, description: meta.description, image, attributes });
+        } catch (e) {
+          if (!e.external) throw e;
+          await Wallet.mintToken(collection, tokenId, meta);
+        }
+      } else {
+        await Wallet.mintToken(collection, tokenId, meta);
+      }
       toast('Minted — waiting for the block…', 'good');
       for (let i = 0; i < 20; i++) {
         await new Promise((r) => setTimeout(r, 3000));
@@ -948,7 +964,7 @@ async function createMint(body, me) {
       toast('Still settling — check the collection in a moment.', '', 7000);
     } catch (e) {
       toast(esc(e.message), 'bad', 9000);
-      btn.disabled = false; btn.textContent = 'Mint it';
+      btn.disabled = false; btn.textContent = fee > 0 ? `Mint for ${fee} KOIN` : 'Mint it';
     }
   };
 }

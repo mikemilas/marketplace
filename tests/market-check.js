@@ -305,6 +305,26 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
     } finally { try { live.kill(); } catch (_) {} }
   }
 
+  /* ---- minting: free, capped, and honest about whose key it needs ---- */
+  r = await api('/api/mint', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ collection: RELICS, owner: user.getAddress(), tokenId: '0x01', name: 'Probe', image: 'https://example.com/a.png' }) });
+  check('a mint on a collection not launched here is sent back to the wallet',
+    r.status === 400 && r.body.external === true && /wallet/i.test(r.body.error || ''), JSON.stringify(r.body));
+
+  r = await api('/api/mint', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ collection: RELICS, owner: user.getAddress(), tokenId: 'not-hex', name: 'Probe', image: 'https://example.com/a.png' }) });
+  check('…and a malformed token id never leaves the building', r.status === 400 && /hex/i.test(r.body.error || ''), JSON.stringify(r.body));
+
+  {
+    // With mints free, the sponsor must refuse ANY KOIN transfer — a fee op
+    // has no business existing when there is no fee.
+    const feeOp = await koinC.encodeOperation({ name: 'transfer', args: { from: user.getAddress(), to: dev.getAddress(), token_id: '0x01' } });
+    const mintOp = await relicsC.encodeOperation({ name: 'mint', args: { to: user.getAddress(), token_id: '0x01' } });
+    r = await sponsor(await craft({ ops: [feeOp, mintOp] }));
+    check('with free mints, no KOIN transfer rides the sponsor — even beside a mint',
+      r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
+  }
+
   /* ---- a launch transaction must PARSE ----
      The contract upload rode on Buffer.toString('base64url'), which never
      pads — and the node's JSON codec requires padded base64url. The first
@@ -386,6 +406,8 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
         DATA_DIR: path.join(SCRATCH, 'mk-ua-' + process.pid),
         KOINOS_NETWORK: 'mainnet',
         AURVANIA_API: `http://127.0.0.1:${standPort}`,
+        KOINOS_DEV_WIF: newSigner().getPrivateKey('wif', true),
+        MINT_PER_DAY_TOTAL: '0',
       }),
       stdio: ['ignore', 'ignore', 'ignore'],
     });
@@ -399,6 +421,14 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
         !!hit && !!hit.ua && !/^node$/i.test(hit.ua), JSON.stringify(hit));
       check('…one on the accepted side of the game host\'s filter, and self-identifying',
         !!hit && /^(curl|Wget)\//.test(hit.ua) && /OURO/i.test(hit.ua), hit && hit.ua);
+
+      const zm = await fetch(`http://127.0.0.1:${UA_PORT}/api/mint`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ collection: RELICS, owner: user.getAddress(), tokenId: '0x01', name: 'Probe', image: 'https://example.com/a.png' }),
+      });
+      const zb = await zm.json();
+      check('the site-wide daily mint budget is enforced before anything is spent',
+        zm.status === 429 && /budget|per day/i.test(zb.error || ''), JSON.stringify(zb));
 
       const d = await (await fetch(`http://127.0.0.1:${UA_PORT}/api/diag?ua=Wget/1.21.3%20(probe)`)).json();
       check('…and the diagnostic can try a different identity from the server itself',

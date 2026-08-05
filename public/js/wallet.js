@@ -213,18 +213,44 @@ const Wallet = (() => {
     return send([op]);
   }
 
-  /** Mint into a collection you own, metadata and all, in one transaction. */
+  /** Mint into a collection you own, metadata and all, in one transaction.
+      When a mint fee is set, it rides along — your KOIN, so your signature. */
   async function mintToken(collection, tokenId, metadata) {
     const { nft } = await loadAbis();
-    const ops = [
-      await encodeOp(collection, nft, 'mint', { to: account.address, token_id: tokenId }),
-    ];
+    const ops = [];
+    if (Number(cfg.mintFeeKoin) > 0 && cfg.treasury) {
+      const tokenAbi = JSON.parse(JSON.stringify(utils.tokenAbi));
+      const k = tokenAbi.koilib_types && tokenAbi.koilib_types.nested.koinos && tokenAbi.koilib_types.nested.koinos.nested;
+      if (k) { delete k.btype; delete k._btype; }
+      ops.push(await encodeOp(cfg.koin, tokenAbi, 'transfer', {
+        from: account.address, to: cfg.treasury,
+        value: BigInt(Math.round(Number(cfg.mintFeeKoin) * 1e8)).toString(),
+      }));
+    }
+    ops.push(await encodeOp(collection, nft, 'mint', { to: account.address, token_id: tokenId }));
     if (metadata) {
       ops.push(await encodeOp(collection, nft, 'set_metadata', {
         token_id: tokenId, metadata: JSON.stringify(metadata),
       }));
     }
     return send(ops);
+  }
+
+  /** The signature-free path: the server mints as the collection itself.
+      Only for free mints on collections launched here; the caller falls
+      back to mintToken when the server says this one is not its to sign. */
+  async function serverMint(body) {
+    const r = await fetch('/api/mint', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, owner: account.address }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      const err = new Error(d.error || 'Mint failed');
+      err.external = !!d.external;
+      throw err;
+    }
+    return d;
   }
 
   /** Launch a collection: the server builds it, you sign it, the server
@@ -268,7 +294,7 @@ const Wallet = (() => {
 
   return {
     init, onChange, connectKondor, hostedLogin, disconnect, adoptWif,
-    listToken, buyToken, cancelOrder, mintToken, launchCollection,
+    listToken, buyToken, cancelOrder, mintToken, serverMint, launchCollection,
     get account() { return account; },
     get cfg() { return cfg; },
     get provider() { return provider; },
