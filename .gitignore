@@ -1,7 +1,6 @@
-node_modules/
 data-live/
 keys.env
 *.env
-contracts/node_modules
+contracts/node_modules/
 contracts/market/build/
 contracts/collection/build/
