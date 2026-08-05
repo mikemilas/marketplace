@@ -668,6 +668,28 @@ function validateLaunch(body) {
   return { name, symbol, description, image, uri, owner, royaltyBps };
 }
 
+
+/** Name a deployed collection and hand it to its creator.
+
+    The payee is the COLLECTION's own account, never the dev wallet. Dev
+    pays the mana, but a transaction's payee is whose NONCE it spends —
+    and the dev wallet is also the game's, signing constantly. Borrowing
+    its nonce here put this transaction in a race it kept losing, which
+    is how a paid-for collection ended up deployed but unnamed. A freshly
+    created account has a nonce nobody else is touching. */
+async function initializeCollection(address, key, spec) {
+  const c = new Contract({ id: address, provider, abi: COLLECTION_ABI, signer: key });
+  const { transaction } = await c.functions.initialize({
+    name: spec.name, symbol: spec.symbol, uri: spec.uri || '', description: spec.description || '',
+    owner: spec.owner, royalty_bps: String(spec.royaltyBps || 0), royalty_address: spec.owner,
+  }, {
+    payer: dev.getAddress(), payee: address, rcLimit: String(5e8),
+    beforeSend: async (t) => { await dev.signTransaction(t); },
+  });
+  await transaction.wait('byTransactionId', 60000);
+  return transaction.id;
+}
+
 /* ---------------- mana sponsorship ---------------- */
 
 /* The rules that keep the dev wallet safe while it pays for strangers:
@@ -1299,21 +1321,15 @@ const api = {
        is retryable rather than lost. */
     const spec = pending.spec;
     let initialized = false;
+    let lastInitError = null;
     for (let attempt = 0; attempt < 3 && !initialized; attempt++) {
       try {
-        const c = new Contract({ id: pending.address, provider, abi: COLLECTION_ABI, signer: key });
-        const { transaction } = await c.functions.initialize({
-          name: spec.name, symbol: spec.symbol, uri: spec.uri, description: spec.description,
-          owner: spec.owner, royalty_bps: String(spec.royaltyBps), royalty_address: spec.owner,
-        }, {
-          payer: dev.getAddress(), payee: dev.getAddress(), rcLimit: String(5e8),
-          beforeSend: async (t) => { await dev.signTransaction(t); },
-        });
-        await transaction.wait('byTransactionId', 60000);
+        await initializeCollection(pending.address, key, spec);
         initialized = true;
       } catch (e) {
-        console.error('[launch] initialize attempt failed —', String((e && e.message) || e).slice(0, 200));
-        await new Promise((r) => setTimeout(r, 3000));
+        lastInitError = String((e && e.message) || e).slice(0, 300);
+        console.error('[launch] initialize attempt failed —', lastInitError);
+        await new Promise((r) => setTimeout(r, 4000));
       }
     }
 
@@ -1331,7 +1347,63 @@ const api = {
     }
     caches.delete('info:' + pending.address);
 
-    json(res, 200, { ok: true, collection: pending.address, initialized });
+    json(res, 200, { ok: true, collection: pending.address, initialized, error: initialized ? null : lastInitError });
+  },
+
+
+  /** Finish a launch that deployed but never got named. The fee is already
+      paid and the contract is already on chain, so this only completes work
+      the creator bought — no key needed, and it can only ever act on an
+      address this server itself launched and recorded as unfinished. */
+  async launchFinish(req, res) {
+    if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+    if (!dev) return json(res, 503, { error: 'Launching is not configured on this server' });
+    const body = await readBody(req);
+    const address = String(body.address || '').trim();
+    const rec = launches.items.find(l => l.address === address);
+    if (!rec) return json(res, 404, { error: 'This server did not launch that collection' });
+
+    let keys = {};
+    try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (_) {}
+    const held = keys[address];
+    if (!held || !held.wif) return json(res, 404, { error: 'No key is held for that collection' });
+
+    // Already named? Then there is nothing to do.
+    try {
+      const live = await collectionInfo(address);
+      if (live.name && !/^Uninitialized/.test(live.name)) {
+        return json(res, 200, { ok: true, already: true, name: live.name });
+      }
+    } catch (_) {}
+
+    const reg = registry.collections.find(c => c.address === address) || {};
+    const spec = {
+      name: String(body.name || reg.name || '').trim(),
+      symbol: String(body.symbol || reg.symbol || '').trim().toUpperCase(),
+      description: String(body.description ?? reg.description ?? ''),
+      uri: '', owner: held.owner,
+      royaltyBps: Math.round(Number(body.royaltyBps ?? reg.royaltyBps ?? 0)),
+    };
+    if (!spec.name || !/^[A-Z0-9]{1,16}$/.test(spec.symbol)) {
+      return json(res, 400, { error: 'Send the name and symbol to finish this collection with' });
+    }
+
+    const key = Signer.fromWif(held.wif);
+    key.provider = provider;
+    try {
+      const id = await initializeCollection(address, key, spec);
+      rec.initialized = true;
+      try { saveJson(LAUNCH_LOG, launches); } catch (_) {}
+      Object.assign(reg, { name: spec.name });
+      saveJson(REGISTRY_FILE, registry);
+      caches.delete('info:' + address);
+      return json(res, 200, { ok: true, collection: address, tx: id, name: spec.name });
+    } catch (e) {
+      // The reason, verbatim: this is the step that has already failed once.
+      const detail = String((e && e.message) || e).slice(0, 300);
+      console.error('[launch] finish failed —', detail);
+      return json(res, 400, { error: 'Could not finish the collection', detail });
+    }
   },
 
   /** Artwork, either uploaded here or linked from anywhere. Uploads are
@@ -1387,6 +1459,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/launch') return await api.launchInfo(req, res, url.searchParams);
     if (p === '/api/launch/prepare') return await api.launchPrepare(req, res);
     if (p === '/api/launch/submit') return await api.launchSubmit(req, res);
+    if (p === '/api/launch/finish') return await api.launchFinish(req, res);
     if (p === '/api/upload') return await api.upload(req, res);
     if ((m = /^\/u\/([a-f0-9]{8,64}\.(?:png|jpg|gif|webp))$/.exec(p))) return serveUpload(res, m[1]);
     if (p.startsWith('/api/')) return json(res, 404, { error: 'no such endpoint' });

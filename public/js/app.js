@@ -270,6 +270,36 @@ async function collectionView(addr, queryString) {
       </div>
     </div>`;
 
+  /* A collection that deployed but never got named is recoverable, and the
+     person looking at it is the one who paid for it — so offer the repair
+     here rather than leaving them with "Uninitialized collection". */
+  if (/^Uninitialized/.test(info.name || '')) {
+    view.querySelector('.c-title').insertAdjacentHTML('beforeend',
+      `<div class="warn" id="c-unfinished">This collection deployed but never finished setup.
+       <button class="linkish" id="c-finish">Finish it now</button></div>`);
+    $('#c-finish').onclick = async () => {
+      const name = prompt('Collection name:', data.meta?.name || '');
+      if (!name) return;
+      const symbol = prompt('Symbol (1-16 letters or digits):', '');
+      if (!symbol) return;
+      const btn = $('#c-finish');
+      btn.disabled = true; btn.textContent = 'Finishing…';
+      try {
+        const r = await fetch('/api/launch/finish', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ address: addr, name, symbol }),
+        });
+        const d = await r.json();
+        if (!r.ok || d.error) throw new Error(d.detail ? `${d.error}: ${d.detail}` : d.error);
+        toast('Collection is live', 'good', 6000);
+        collectionView(addr, queryString);
+      } catch (e) {
+        toast(esc(e.message), 'bad', 9000);
+        btn.disabled = false; btn.textContent = 'Finish it now';
+      }
+    };
+  }
+
   const side = $('#c-side');
   const grid = $('#c-grid');
   $('#c-sort').value = state.get('sort') || 'default';
