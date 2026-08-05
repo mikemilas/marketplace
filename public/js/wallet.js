@@ -215,8 +215,8 @@ const Wallet = (() => {
 
   /** Mint into a collection you own, metadata and all, in one transaction.
       When a mint fee is set, it rides along — your KOIN, so your signature. */
-  async function mintToken(collection, tokenId, metadata) {
-    const { nft } = await loadAbis();
+  async function mintToken(collection, tokenId, metadata, { listPriceSats = null } = {}) {
+    const { nft, market } = await loadAbis();
     const ops = [];
     if (Number(cfg.mintFeeKoin) > 0 && cfg.treasury) {
       const tokenAbi = JSON.parse(JSON.stringify(utils.tokenAbi));
@@ -233,7 +233,62 @@ const Wallet = (() => {
         token_id: tokenId, metadata: JSON.stringify(metadata),
       }));
     }
+    if (listPriceSats) {
+      // Mint and shopfront in one signature: approve the market, open the order.
+      ops.push(await encodeOp(collection, nft, 'approve', {
+        approver_address: account.address, to: cfg.market, token_id: tokenId,
+      }));
+      ops.push(await encodeOp(cfg.market, market, 'create_order', {
+        collection, token_id: tokenId, price: String(listPriceSats), expires: '0',
+      }));
+    }
     return send(ops);
+  }
+
+  /** List several tokens in one go: one approval covering the collection,
+      then an order per token. Listing is the one thing the collection
+      cannot sign for its owner — an order moves YOUR property, so YOUR
+      authority creates it (silent for hosted keys, one Kondor popup). */
+  async function listTokens(collection, entries) {
+    const { market, nft } = await loadAbis();
+    if (!entries.length) return null;
+    /* ~1 KOIN of mana per operation against a 15 KOIN sponsor ceiling:
+       ten orders plus their approval per transaction, then start the next
+       one — waiting for the previous chunk to reach the chain, because
+       two transactions from one account cannot share a nonce. */
+    const CHUNK = 10;
+    let last = null;
+    for (let at = 0; at < entries.length; at += CHUNK) {
+      const slice = entries.slice(at, at + CHUNK);
+      const ops = [];
+      if (at === 0) {
+        ops.push(slice.length === 1 && entries.length === 1
+          ? await encodeOp(collection, nft, 'approve', {
+              approver_address: account.address, to: cfg.market, token_id: slice[0].tokenId,
+            })
+          : await encodeOp(collection, nft, 'set_approval_for_all', {
+              approver_address: account.address, operator_address: cfg.market, approved: true,
+            }));
+      }
+      for (const e of slice) {
+        ops.push(await encodeOp(cfg.market, market, 'create_order', {
+          collection, token_id: e.tokenId, price: String(e.priceSats), expires: '0',
+        }));
+      }
+      last = await send(ops);
+      if (at + CHUNK < entries.length) {
+        // The next chunk needs this one's nonce settled on chain first.
+        for (let w = 0; w < 15; w++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            const q = await fetch(`/api/collections/${collection}/token/${encodeURIComponent(slice[slice.length - 1].tokenId)}`);
+            const d = await q.json();
+            if (d.order && !d.order.dead) break;
+          } catch (_) {}
+        }
+      }
+    }
+    return last;
   }
 
   /** The signature-free path: the server mints as the collection itself.
@@ -294,7 +349,7 @@ const Wallet = (() => {
 
   return {
     init, onChange, connectKondor, hostedLogin, disconnect, adoptWif,
-    listToken, buyToken, cancelOrder, mintToken, serverMint, launchCollection,
+    listToken, buyToken, cancelOrder, mintToken, serverMint, listTokens, launchCollection,
     get account() { return account; },
     get cfg() { return cfg; },
     get provider() { return provider; },

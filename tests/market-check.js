@@ -325,6 +325,26 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
   }
 
+  /* ---- mint-and-list: a whole shopfront in one sponsored tx ----
+     One blanket approval plus ten orders is eleven ops ≈ 11 KOIN of mana,
+     inside the 15 KOIN ceiling — the sponsor must wave it through to the
+     mempool rather than refuse it at the gate. */
+  {
+    const ops = [await relicsC.encodeOperation({
+      name: 'set_approval_for_all',
+      args: { approver_address: user.getAddress(), operator_address: MARKET, approved: true },
+    })];
+    for (let i = 0; i < 10; i++) {
+      ops.push(await marketC.encodeOperation({
+        name: 'create_order',
+        args: { collection: RELICS, token_id: '0x0' + i.toString(16), price: '100000000', expires: '0' },
+      }));
+    }
+    r = await sponsor(await craft({ ops, rcLimit: '1500000000' }));
+    check('a blanket approval plus ten listings clears the sponsor in one transaction',
+      !/ceiling|not something|payee|payer/.test(r.body.error || ''), JSON.stringify(r.body).slice(0, 160));
+  }
+
   /* ---- an oversize upload gets an answer, not a dead socket ----
      The server used to destroy the connection mid-body, which a browser
      reports as a bare "Failed to fetch" — indistinguishable from the

@@ -894,6 +894,11 @@ async function createMint(body, me, info = {}) {
       <label for="mt-desc">Description <span class="dim">(optional)</span></label>
       <textarea id="mt-desc" rows="3" placeholder="Anything a collector should know"></textarea>
       ${artField('mt-img', 'Artwork')}
+      <label for="mt-price">List for sale <span class="dim">(optional) — price in KOIN; leave empty to just mint</span></label>
+      <div class="price-field">
+        <input id="mt-price" type="number" min="0" step="0.00000001" placeholder="not for sale" inputmode="decimal">
+        <span>KOIN</span>
+      </div>
       <label>Traits <span class="dim">(optional)</span></label>
       <div id="mt-traits"></div>
       <button class="btn" id="mt-addtrait" type="button">+ Add a trait</button>
@@ -916,6 +921,11 @@ async function createMint(body, me, info = {}) {
       <input id="bk-prefix" maxlength="40" placeholder="Duck">
       <label for="bk-files">Images</label>
       <input id="bk-files" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp">
+      <label for="bk-price">List each for sale <span class="dim">(optional) — KOIN each; a "price" field on a JSON item overrides it</span></label>
+      <div class="price-field">
+        <input id="bk-price" type="number" min="0" step="0.00000001" placeholder="not for sale" inputmode="decimal">
+        <span>KOIN</span>
+      </div>
       <label for="bk-json">Metadata JSON — pick the file or paste it</label>
       <input id="bk-json" type="file" accept=".json,application/json">
       <textarea id="bk-paste" rows="3" placeholder='[{"image":"1.png","attributes":[{"trait_type":"Rarity","value":"Common"}]}]'></textarea>
@@ -962,17 +972,29 @@ async function createMint(body, me, info = {}) {
         image: image.startsWith('/u/') ? location.origin + image : image,
         attributes,
       };
+      const priceKoin = parseFloat($('#mt-price').value);
+      const priceSats = priceKoin > 0 ? BigInt(Math.round(priceKoin * 1e8)).toString() : null;
       if (fee === 0) {
         /* Server-signed: the collection mints as itself, so nothing needs
            your key. Collections not launched here fall back to the wallet. */
+        let external = false;
         try {
           await Wallet.serverMint({ collection, tokenId, name, description: meta.description, image, attributes });
         } catch (e) {
           if (!e.external) throw e;
-          await Wallet.mintToken(collection, tokenId, meta);
+          external = true;
+          await Wallet.mintToken(collection, tokenId, meta, { listPriceSats: priceSats });
+        }
+        if (priceSats && !external) {
+          /* Listing moves YOUR property, so it carries YOUR signature —
+             silent for hosted keys, one Kondor popup. A mint that landed
+             stays landed even if the listing then fails. */
+          btn.innerHTML = '<span class="spin"></span> Listing…';
+          try { await Wallet.listTokens(collection, [{ tokenId, priceSats }]); }
+          catch (e) { toast(`Minted, but the listing failed: ${esc(e.message)} — you can list it from the item page.`, 'bad', 9000); }
         }
       } else {
-        await Wallet.mintToken(collection, tokenId, meta);
+        await Wallet.mintToken(collection, tokenId, meta, { listPriceSats: priceSats });
       }
       toast('Minted — waiting for the block…', 'good');
       for (let i = 0; i < 20; i++) {
@@ -1134,7 +1156,25 @@ async function createMint(body, me, info = {}) {
           return;
         }
         if (!r.ok || d.error) throw new Error(d.error || 'Bulk mint failed');
-        toast(`🎉 ${d.minted.length} NFTs minted`, 'good', 8000);
+
+        /* Straight onto the shopfront. The default price comes from the
+           field; a "price" on a JSON item wins for that item. */
+        const defKoin = parseFloat($('#bk-price').value);
+        const toList = d.minted.map((m, i) => {
+          const koin = Number(entries[i] && entries[i].price != null ? entries[i].price : defKoin);
+          return koin > 0 ? { tokenId: m.tokenId, priceSats: BigInt(Math.round(koin * 1e8)).toString() } : null;
+        }).filter(Boolean);
+        if (toList.length) {
+          go.innerHTML = `<span class="spin"></span> Listing ${toList.length} for sale…`;
+          try {
+            await Wallet.listTokens(collection, toList);
+            toast(`🎉 ${d.minted.length} minted, ${toList.length} listed for sale`, 'good', 8000);
+          } catch (e) {
+            toast(`Minted ${d.minted.length}, but listing failed: ${esc(e.message)} — list them from their item pages.`, 'bad', 10000);
+          }
+        } else {
+          toast(`🎉 ${d.minted.length} NFTs minted`, 'good', 8000);
+        }
         location.hash = '#/c/' + collection;
       } catch (e) {
         toast(esc(e.message), 'bad', 10000);

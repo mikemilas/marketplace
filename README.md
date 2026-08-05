@@ -180,7 +180,12 @@ re-read the chain.
   server-signed in chunks of five per transaction. A batch spends the daily
   mint budget per item and either fits whole or is refused whole; if a chunk
   fails mid-drop the response lists exactly what minted so nothing is
-  minted twice. Free mints need **no wallet signature**: a
+  minted twice. Both mint forms take an optional **list-for-sale price in
+  KOIN** — the drop lands straight on the shopfront. A `"price"` field on a
+  JSON item overrides the batch price for that item. Minting can be
+  server-signed, but LISTING moves the owner's property, so it carries the
+  owner's signature: silent for hosted keys, one Kondor popup, one blanket
+  approval plus ten orders per transaction. Free mints need **no wallet signature**: a
   launched collection accepts its own account's authority for
   mint/set_metadata, and OURO holds that key already (it is the upgrade
   authority — strictly stronger, so no new trust). The server mints as the

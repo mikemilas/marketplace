@@ -351,8 +351,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('…and traits can be added as key/value pairs', mint.traitRows === 1, JSON.stringify(mint));
 
   /* ---- bulk mint: matched by filename, tallied before anything is spent ---- */
+  check('minting offers an optional list-for-sale price in KOIN',
+    await page.evaluate(() => !!document.querySelector('#mt-price')), 'no price field on single mint');
   check('a bulk drop card is offered while minting is free',
     await page.evaluate(() => !!document.querySelector('#bulk-card')), 'no bulk card');
+  check('…and the bulk card offers a per-drop price with JSON override',
+    await page.evaluate(() => !!document.querySelector('#bk-price')), 'no bulk price field');
   await page.evaluate(() => {
     document.querySelector('#bk-paste').value = JSON.stringify([
       { image: '1.png', attributes: [{ trait_type: 'Rarity', value: 'Common' }] },
