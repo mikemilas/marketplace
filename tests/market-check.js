@@ -325,6 +325,21 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
   }
 
+  /* ---- an oversize upload gets an answer, not a dead socket ----
+     The server used to destroy the connection mid-body, which a browser
+     reports as a bare "Failed to fetch" — indistinguishable from the
+     network dropping. Someone lost a whole bulk drop to that. */
+  {
+    const big = Buffer.alloc(5 * 1024 * 1024, 7);
+    big[0] = 0x89; big[1] = 0x50; big[2] = 0x4e; big[3] = 0x47;   // PNG magic
+    const r413 = await fetch(`http://127.0.0.1:${PORT}/api/upload`, {
+      method: 'POST', headers: { 'Content-Type': 'image/png' }, body: big,
+    }).then(async (rr) => ({ status: rr.status, body: await rr.json().catch(() => null) }))
+      .catch((e) => ({ status: 0, body: { error: String(e.message) } }));
+    check('an image over the size cap is refused with words, never a dead socket',
+      r413.status === 413 && /larger than/.test(r413.body?.error || ''), JSON.stringify(r413).slice(0, 160));
+  }
+
   /* ---- bulk minting: refused whole, or fits whole ---- */
   const twoDucks = [
     { tokenId: '0x4401', name: 'Duck #1', image: 'https://example.com/1.png', attributes: [{ trait_type: 'Rarity', value: 'Common' }] },

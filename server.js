@@ -623,15 +623,24 @@ function imageKind(b) {
 }
 
 function readRaw(req, max) {
+  /* Never destroy the socket on an oversize body: from the browser a
+     killed connection is a bare "Failed to fetch", indistinguishable from
+     a network drop. Resolve 'OVERSIZE' and keep draining, so the caller
+     can answer 413 with words in it. Bodies that announce their size in
+     Content-Length are refused before a byte is read. */
   return new Promise((resolve) => {
+    const declared = parseInt(req.headers['content-length'] || '0', 10);
+    if (declared > max) { req.resume(); return resolve('OVERSIZE'); }
     const chunks = [];
     let size = 0;
+    let over = false;
     req.on('data', (c) => {
+      if (over) return;
       size += c.length;
-      if (size > max) { req.destroy(); return resolve(null); }
+      if (size > max) { over = true; chunks.length = 0; req.resume(); return resolve('OVERSIZE'); }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => { if (!over) resolve(Buffer.concat(chunks)); });
     req.on('error', () => resolve(null));
   });
 }
@@ -1846,7 +1855,10 @@ const api = {
       return json(res, 429, { error: 'Too many uploads — slow down' });
     }
     const buf = await readRaw(req, CFG.UPLOAD_MAX_BYTES);
-    if (!buf) return json(res, 413, { error: `Images must be ${Math.round(CFG.UPLOAD_MAX_BYTES / 1048576)}MB or smaller` });
+    if (buf === 'OVERSIZE') {
+      return json(res, 413, { error: `That image is larger than ${Math.round(CFG.UPLOAD_MAX_BYTES / 1048576)}MB — resize it and try again` });
+    }
+    if (!buf) return json(res, 400, { error: 'The upload did not arrive whole — try again' });
     const kind = imageKind(buf);
     if (!kind) return json(res, 400, { error: 'That file is not a PNG, JPEG, GIF or WebP image' });
     const hash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 40);

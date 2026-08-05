@@ -1092,13 +1092,28 @@ async function createMint(body, me, info = {}) {
            and the same File object dedupes however it was matched. */
         const urls = new Map();
         let n = 0;
+        /* Phones drop connections; one blip must not kill a whole drop.
+           Three tries per file, and a failure names the file and its size
+           instead of the browser's bare "Failed to fetch". */
+        const uploadOne = async (f) => {
+          for (let a = 1; ; a++) {
+            try {
+              const r = await fetch('/api/upload', { method: 'POST', headers: { 'Content-Type': f.type || 'image/png' }, body: f });
+              const d = await r.json();
+              if (!r.ok || d.error) throw new Error(d.error || `upload failed (HTTP ${r.status})`);
+              return d.path || d.url;
+            } catch (e) {
+              const reason = /failed to fetch/i.test(e.message) ? 'the connection dropped' : e.message;
+              if (a >= 3) throw new Error(`${f.name} (${(f.size / 1048576).toFixed(1)}MB): ${reason}. Nothing was minted — tap the button to try again.`);
+              go.innerHTML = `<span class="spin"></span> Retrying ${esc(f.name)} (try ${a + 1} of 3)…`;
+              await new Promise((r2) => setTimeout(r2, 1500 * a));
+            }
+          }
+        };
         for (const f of matchedFiles) {
           if (urls.has(f)) continue;
-          go.innerHTML = `<span class="spin"></span> Uploading art ${++n}…`;
-          const r = await fetch('/api/upload', { method: 'POST', headers: { 'Content-Type': f.type || 'image/png' }, body: f });
-          const d = await r.json();
-          if (!r.ok || d.error) throw new Error(`${f.name}: ${d.error || 'upload failed'}`);
-          urls.set(f, d.path || d.url);
+          go.innerHTML = `<span class="spin"></span> Uploading art ${++n} of ${new Set(matchedFiles).size}…`;
+          urls.set(f, await uploadOne(f));
         }
         const items = entries.map((e, i) => ({
           tokenId: toHexId(`${pid}${String(i + 1).padStart(4, '0')}`),
