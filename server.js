@@ -1780,8 +1780,30 @@ server.listen(CFG.PORT, () => {
     console.warn('     A deploy that replaces the app replaces this too — and it holds the');
     console.warn('     collection upgrade keys. Point DATA_DIR somewhere the deploy cannot reach.');
   }
-  // Warm the trade history so the first visitor does not pay for the walk.
-  refreshHistory({ force: true })
-    .then((h) => { if (h.events.length) console.log(`   history: indexed to ${h.events.length} event(s)`); })
-    .catch(() => {});
+  /* Is the platform relaunching us in a loop? A respawn every second or
+     two pegs the host — each cold boot loads the whole dependency tree —
+     and from outside it reads as "hosting maxed" plus requests that hang
+     forever, with no error anywhere. Count our own births and say so. */
+  const BOOTS_FILE = path.join(CFG.DATA_DIR, 'boots.json');
+  try {
+    const boots = (loadJson(BOOTS_FILE, { times: [] }).times || [])
+      .filter(t => Date.now() - t < 120000);
+    boots.push(Date.now());
+    saveJson(BOOTS_FILE, { times: boots.slice(-20) });
+    if (boots.length >= 3) {
+      console.warn(`   ⚠ THIS APP HAS STARTED ${boots.length} TIMES IN TWO MINUTES.`);
+      console.warn('     The platform is relaunching it in a loop — that is what maxes the');
+      console.warn('     hosting and hangs every request. Usual cause: the app binds a port');
+      console.warn('     the platform is not proxying to (check the "port:" line above), or');
+      console.warn('     a supervisor health check that cannot reach it.');
+    }
+  } catch (_) {}
+
+  /* Warm the trade history AFTER things settle rather than at each birth:
+     a boot must cost nearly nothing, precisely because of the loop above. */
+  setTimeout(() => {
+    refreshHistory({ force: true })
+      .then((h) => { if (h.events.length) console.log(`   history: indexed to ${h.events.length} event(s)`); })
+      .catch(() => {});
+  }, 20000);
 });
