@@ -82,8 +82,23 @@ function bigEnv(name, fallback) {
   }
 }
 
+/* Which port the host wants us on. Platforms inject this under different
+   names, and getting it wrong is invisible from inside the process: the
+   app starts, binds, logs happily — and every request still 503s because
+   the proxy is pointed somewhere else, so the supervisor restarts it in a
+   loop. Take the first one offered, and say at boot where it came from. */
+const PORT_VARS = ['PORT', 'APP_PORT', 'SERVER_PORT', 'NODE_PORT', 'HTTP_PORT', 'LISTEN_PORT'];
+function choosePort() {
+  for (const name of PORT_VARS) {
+    const v = parseInt(process.env[name] || '', 10);
+    if (v > 0 && v < 65536) return { port: v, from: name };
+  }
+  return { port: 3100, from: null };
+}
+const PORT_CHOICE = choosePort();
+
 const CFG = {
-  PORT: parseInt(process.env.PORT || '3100', 10),
+  PORT: PORT_CHOICE.port,
   DATA_DIR: path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data-live')),
   NETWORK: (process.env.KOINOS_NETWORK || 'mainnet').trim(),
   MARKET_ADDR: (process.env.MARKET_ADDR || '').trim(),
@@ -1508,6 +1523,20 @@ server.on('error', (e) => {
 
 server.listen(CFG.PORT, () => {
   console.log(`⭕ OURO marketplace listening on http://0.0.0.0:${CFG.PORT}`);
+  if (PORT_CHOICE.from) {
+    console.log(`   port:    ${CFG.PORT} (from ${PORT_CHOICE.from})`);
+  } else {
+    /* Nothing told us, so this is a guess — and a wrong guess looks
+       exactly like a healthy app that nobody can reach. List what the
+       environment actually offers so the answer stops being a hunt. */
+    const candidates = Object.keys(process.env)
+      .filter((k) => /PORT/i.test(k))
+      .map((k) => `${k}=${process.env[k]}`);
+    console.warn(`   ⚠ port:  ${CFG.PORT} is a FALLBACK — no port variable was set.`);
+    console.warn(`     If the site answers 503 while this log looks fine, the host is`);
+    console.warn(`     proxying to a different port. Set PORT to the one it expects.`);
+    console.warn(`     Port-ish variables present: ${candidates.length ? candidates.join(', ') : '(none)'}`);
+  }
   console.log(`   chain:   ${NET.label} · ${RPCS.join(', ')}`);
   console.log(`   market:  ${CFG.MARKET_ADDR || 'NOT SET — deploy the contract and set MARKET_ADDR'}`);
   console.log(`   sponsor: ${dev ? `on — payer ${dev.getAddress()}` : 'OFF (KOINOS_DEV_WIF not set)'}`);
