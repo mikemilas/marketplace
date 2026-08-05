@@ -1360,13 +1360,17 @@ const api = {
     if (!dev) return json(res, 503, { error: 'Launching is not configured on this server' });
     const body = await readBody(req);
     const address = String(body.address || '').trim();
-    const rec = launches.items.find(l => l.address === address);
-    if (!rec) return json(res, 404, { error: 'This server did not launch that collection' });
-
+    /* The KEY is what makes recovery possible, so it is the thing to look
+       for — the launch log is only bookkeeping and a redeploy can lose it. */
     let keys = {};
     try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (_) {}
     const held = keys[address];
-    if (!held || !held.wif) return json(res, 404, { error: 'No key is held for that collection' });
+    if (!held || !held.wif) {
+      return json(res, 404, {
+        error: 'No key is held for that collection, so it cannot be finished from here',
+      });
+    }
+    const rec = launches.items.find(l => l.address === address) || { address, owner: held.owner };
 
     // Already named? Then there is nothing to do.
     try {
@@ -1391,6 +1395,27 @@ const api = {
     const key = Signer.fromWif(held.wif);
     key.provider = provider;
     try {
+      /* Collections launched before the null-field fix carry a binary whose
+         initialize traps on an absent uri or description. We hold the
+         account key, so the fix is an upgrade in place rather than a
+         write-off — uploading the current contract over the old one. */
+      if (fs.existsSync(COLLECTION_WASM)) {
+        const up = new Transaction({
+          signer: key, provider,
+          options: { payer: dev.getAddress(), payee: address, rcLimit: String(80e8) },
+        });
+        await up.pushOperation({
+          upload_contract: {
+            contract_id: address,
+            bytecode: fs.readFileSync(COLLECTION_WASM).toString('base64url'),
+          },
+        });
+        await up.prepare();
+        await up.sign();
+        await dev.signTransaction(up.transaction);
+        await up.send();
+        await up.wait('byTransactionId', 60000);
+      }
       const id = await initializeCollection(address, key, spec);
       rec.initialized = true;
       try { saveJson(LAUNCH_LOG, launches); } catch (_) {}
@@ -1489,6 +1514,11 @@ server.listen(CFG.PORT, () => {
   console.log(`   sign-in: bridged to ${CFG.AURVANIA_API}`);
   console.log(`   registry: ${registry.collections.length} collection(s) · admin ${CFG.ADMIN_KEY ? 'enabled' : 'OFF'}`);
   console.log(`   history: ${history.events.length} known event(s)`);
+  if (CFG.DATA_DIR.startsWith(__dirname)) {
+    console.warn(`   ⚠ DATA_DIR is inside the app directory (${CFG.DATA_DIR}).`);
+    console.warn('     A deploy that replaces the app replaces this too — and it holds the');
+    console.warn('     collection upgrade keys. Point DATA_DIR somewhere the deploy cannot reach.');
+  }
   // Warm the trade history so the first visitor does not pay for the walk.
   refreshHistory({ force: true })
     .then((h) => { if (h.events.length) console.log(`   history: indexed to ${h.events.length} event(s)`); })

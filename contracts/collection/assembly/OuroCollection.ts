@@ -99,22 +99,34 @@ export class OuroCollection extends Nft {
       "the collection account must authorize its own setup"
     );
 
-    System.require(args.name!.length > 0 && args.name!.length <= 64, "name must be 1-64 characters");
-    System.require(args.symbol!.length > 0 && args.symbol!.length <= 16, "symbol must be 1-16 characters");
-    System.require(args.description!.length <= 1000, "description must be 1000 characters or fewer");
-    System.require(args.uri!.length <= 300, "uri must be 300 characters or fewer");
-    System.require(args.royalty_bps <= MAX_ROYALTY, "royalty cannot exceed 10%");
-    System.require(args.owner!.length > 0, "an owner is required");
+    /* Protobuf omits empty strings, so a collection launched with no uri
+       or no description arrives here with those fields ABSENT — decoded
+       as null, not "". Dereferencing one traps the module, and since the
+       build strips abort messages the chain can only report "module
+       exited due to trap". Normalize first, validate second. */
+    const name = args.name === null ? "" : args.name!;
+    const symbol = args.symbol === null ? "" : args.symbol!;
+    const description = args.description === null ? "" : args.description!;
+    const uri = args.uri === null ? "" : args.uri!;
+    const owner = args.owner === null ? new Uint8Array(0) : args.owner!;
+    const royaltyTo = args.royalty_address === null ? new Uint8Array(0) : args.royalty_address!;
 
-    c.name = args.name;
-    c.symbol = args.symbol;
-    c.uri = args.uri;
-    c.description = args.description;
+    System.require(name.length > 0 && name.length <= 64, "name must be 1-64 characters");
+    System.require(symbol.length > 0 && symbol.length <= 16, "symbol must be 1-16 characters");
+    System.require(description.length <= 1000, "description must be 1000 characters or fewer");
+    System.require(uri.length <= 300, "uri must be 300 characters or fewer");
+    System.require(args.royalty_bps <= MAX_ROYALTY, "royalty cannot exceed 10%");
+    System.require(owner.length > 0, "an owner is required");
+
+    c.name = name;
+    c.symbol = symbol;
+    c.uri = uri;
+    c.description = description;
     c.initialized = true;
     this.config.put(c);
 
     if (args.royalty_bps > 0) {
-      const to = args.royalty_address!.length > 0 ? args.royalty_address! : args.owner!;
+      const to = royaltyTo.length > 0 ? royaltyTo : owner;
       const r = new nft.royalties();
       r.value.push(new nft.royalty(args.royalty_bps, to));
       this._royalties.put(r);
@@ -122,15 +134,15 @@ export class OuroCollection extends Nft {
 
     // The creator owns it from here: mint, metadata, royalties, and any
     // later transfer of ownership are all theirs.
-    this.collectionOwner.put(new common.address(args.owner!));
+    this.collectionOwner.put(new common.address(owner));
 
     System.event(
       "collection.initialized",
       Protobuf.encode<collection.initialized_event>(
-        new collection.initialized_event(args.name!, args.symbol!, args.owner!, args.royalty_bps),
+        new collection.initialized_event(name, symbol, owner, args.royalty_bps),
         collection.initialized_event.encode
       ),
-      [args.owner!]
+      [owner]
     );
   }
 }
