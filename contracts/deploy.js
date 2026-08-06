@@ -4,6 +4,9 @@
    Usage:
      node deploy.js keygen  --keys keys.env
      node deploy.js deploy  --keys keys.env [--network harbinger|mainnet]
+     node deploy.js upgrade --keys keys.env [--network ...]
+                            (re-uploads the bytecode over the LIVE contract;
+                             orders and config are storage and survive intact)
      node deploy.js config  --keys keys.env [--network ...]
                             [--treasury <addr>] [--fee-bps 250]
      node deploy.js status  --keys keys.env [--network ...]
@@ -178,6 +181,23 @@ function sanitizeAbi(json) {
       }));
       console.log(`deploy:   ${net.explorer}/address/${marketId}`);
     }
+  }
+
+  if (cmd === 'upgrade') {
+    /* Same upload as deploy, WITHOUT the already-live skip: replacing the
+       bytecode on the same account is how a Koinos contract upgrades, and
+       its storage (orders, config) is untouched by the swap. */
+    const bytes = marketC.bytecode;
+    const need = bytes.length * KOIN_PER_BYTE * 1.08;
+    if (mana < need) {
+      console.error(`upgrade: needs ~${need.toFixed(1)} KOIN of mana in one transaction; the dev wallet has ${mana.toFixed(2)}.`);
+      process.exit(1);
+    }
+    await send('upgrade', async () => marketC.deploy({
+      ...(await paidByDev(bytes.length * KOIN_PER_BYTE)),
+      abi: abiJson(),
+    }));
+    console.log(`upgrade:  new bytecode live, state untouched — ${net.explorer}/address/${marketId}`);
   }
 
   if (cmd === 'deploy' || cmd === 'config') {

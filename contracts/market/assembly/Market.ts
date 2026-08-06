@@ -17,8 +17,10 @@
 //     no state in which money moved and the NFT did not.
 //
 //   * Royalties are the COLLECTION's, not ours. Whatever the collection
-//     contract declares (KCS-2 royalties(), percentage per 10000) is paid,
-//     capped at 10% — the same cap Kollection enforced.
+//     contract declares through royalties() is paid, capped at 10% — the
+//     same cap Kollection enforced. KCS-2 contracts declare per 10,000;
+//     Kollection-era contracts declared per 100,000, and are recognized
+//     by their missing get_tokens.
 //
 // Where it deliberately differs from the original:
 //
@@ -45,6 +47,7 @@ const ORDERS_SPACE_ID = 1;
 const FEE_CAP: u32 = 1000;        // 10% — the most set_config will ever accept
 const ROYALTY_CAP: u64 = 1000;    // 10% of the sale, same ceiling Kollection used
 const MAX_EXPIRY_MS: u64 = 31536000000; // one year — beyond that, list again
+const GET_TOKENS_ENTRY: u32 = 0x7d5b5ed7; // KCS-2 get_tokens — the dialect probe
 
 export class Market {
   callArgs: System.getArgumentsReturn | null;
@@ -271,16 +274,34 @@ export class Market {
     }
 
     // 2. The collection's royalties, exactly as declared, capped at 10%.
+    //    Two royalty dialects exist on this chain: KCS-2 contracts declare
+    //    basis points per 10,000, while Kollection-era contracts declared
+    //    per 100,000 — The Crew's "5000" paid 5% on real Kollection sales,
+    //    not 50%. They are told apart the only way the chain can: KCS-2
+    //    contracts answer get_tokens, Kollection-era ones cannot.
+    const probeArgs = new nft.get_tokens_args();
+    probeArgs.limit = 1;
+    const probe = System.call(
+      args.collection!,
+      GET_TOKENS_ENTRY,
+      Protobuf.encode(probeArgs, nft.get_tokens_args.encode)
+    );
+    const royaltyBase: u64 = probe.code == 0 ? 10000 : 100000;
+
     let royaltiesPaid: u64 = 0;
     const royalties = collection.royalties();
     let royaltyBps: u64 = 0;
     for (let i = 0; i < royalties.value.length; i += 1) {
-      royaltyBps += royalties.value[i].percentage;
+      const p = royalties.value[i].percentage;
+      // A single share past the whole base is garbage; refusing it here
+      // also keeps the sum below any overflow long before the cap check.
+      System.require(p <= royaltyBase, "collection royalties exceed 10%");
+      royaltyBps += p;
     }
-    System.require(royaltyBps <= ROYALTY_CAP, "collection royalties exceed 10%");
+    System.require(royaltyBps * 10000 <= ROYALTY_CAP * royaltyBase, "collection royalties exceed 10%");
     for (let i = 0; i < royalties.value.length; i += 1) {
       const r = royalties.value[i];
-      const cut = (price * r.percentage) / 10000;
+      const cut = (price * r.percentage) / royaltyBase;
       if (cut > 0 && !!r.address && r.address!.length > 0) {
         pay.transfer(new token.transfer_args(buyer, r.address!, cut));
         remain -= cut;

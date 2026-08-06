@@ -247,6 +247,15 @@ async function collectionInfo(addr) {
       const { result } = await c.functions.royalties({});
       out.royaltyBps = (result?.value || []).reduce((s, r) => s + Number(r.percentage || 0), 0);
     } catch (_) { out.royaltyBps = 0; }
+    /* Kollection-era contracts (no get_tokens) declared royalties per
+       100,000 — The Crew's "5000" paid 5% on real Kollection sales, not
+       50%. Normalize to basis points so every display and fee breakdown
+       says what a buyer will actually be charged. The market contract
+       makes the same call with the same probe. */
+    if (out.royaltyBps > 0) {
+      try { await c.functions.get_tokens({ limit: 1 }); }
+      catch (_) { out.legacyRoyalty = true; out.royaltyBps = Math.round(out.royaltyBps / 10); }
+    }
     return out;
   });
 }
@@ -285,20 +294,40 @@ async function tokenMeta(addr, tokenIdHex) {
       if (result?.value) { try { return JSON.parse(result.value); } catch (_) {} }
     } catch (_) {}
     const info = await collectionInfo(addr);
-    let base = String(info.uri || '').trim();
+    const base = String(info.uri || '').trim();
     if (!base) return null;
-    if (base.startsWith('ipfs://')) base = 'https://ipfs.io/ipfs/' + base.slice(7);
-    if (!/^https?:\/\//.test(base)) return null;
-    const label = hexToLabel(tokenIdHex);
-    const url = base.replace(/\/$/, '') + '/' + encodeURIComponent(label);
-    try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(8000), size: 1048576 });
-      if (!r.ok) return null;
-      const text = (await r.text()).slice(0, 262144);
-      return JSON.parse(text);
-    } catch (_) { return null; }
+    const isIpfs = base.startsWith('ipfs://');
+    if (!isIpfs && !/^https?:\/\//.test(base)) return null;
+    /* Two file-name conventions exist in the wild — our own launches use
+       the human label, Kollection-era drops keyed files by the HEX id
+       (…/0x31). And ipfs.io routinely fails content that dweb.link still
+       serves, so an ipfs uri gets a second gateway before giving up. The
+       combination that answers first is remembered per collection, so an
+       index walk pays the discovery timeouts once, not sixty times. */
+    const roots = isIpfs
+      ? ['https://ipfs.io/ipfs/' + base.slice(7), 'https://dweb.link/ipfs/' + base.slice(7)]
+      : [base];
+    const names = [encodeURIComponent(hexToLabel(tokenIdHex)), tokenIdHex.toLowerCase()];
+    const combos = [];
+    for (const root of roots) for (const name of names) combos.push({ root, name, idx: combos.length });
+    const hint = metaPathHints.get(addr);
+    if (hint != null && hint > 0 && hint < combos.length) {
+      combos.unshift(combos.splice(hint, 1)[0]);
+    }
+    for (const c of combos) {
+      try {
+        const r = await fetch(`${c.root.replace(/\/$/, '')}/${c.name}`, { signal: AbortSignal.timeout(8000), size: 1048576 });
+        if (!r.ok) continue;
+        const text = (await r.text()).slice(0, 262144);
+        const parsed = JSON.parse(text);
+        metaPathHints.set(addr, c.idx);
+        return parsed;
+      } catch (_) {}
+    }
+    return null;
   });
 }
+const metaPathHints = new Map(); // collection -> canonical index of the combo that answered
 
 const rewriteImg = (u) => {
   if (typeof u !== 'string') return null;
@@ -369,6 +398,34 @@ async function collectionIndex(addr) {
       if (batch.length < 100) break;
       start = batch[batch.length - 1];
       if (ids.length >= INDEX_MAX_TOKENS) { partial = true; break; }
+    }
+    /* Kollection-era contracts have no get_tokens at all — their only
+       enumeration is per-owner. Every one of them numbers its tokens with
+       plain decimal strings, so when the walk finds nothing but the
+       supply says otherwise, probe "1"…N (and "0"…N-1) against owner_of
+       and keep whichever ids exist. */
+    if (!ids.length) {
+      const info = await collectionInfo(addr).catch(() => ({}));
+      const supply = Math.min(Number(info.totalSupply || 0), INDEX_MAX_TOKENS);
+      if (supply > 0) {
+        const asHex = (s) => '0x' + [...s].map((ch) => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+        const firstOwned = async (label) => {
+          try { return !!(await c.functions.owner_of({ token_id: asHex(label) })).result?.value; }
+          catch (_) { return false; }
+        };
+        const base = (await firstOwned('1')) ? 1 : (await firstOwned('0')) ? 0 : null;
+        if (base !== null) {
+          const probed = await mapPool(
+            Array.from({ length: supply }, (_, i) => asHex(String(base + i))),
+            META_CONCURRENCY,
+            async (tid) => {
+              const owner = (await c.functions.owner_of({ token_id: tid })).result?.value;
+              return owner ? tid : null;
+            });
+          ids.push(...probed.filter(Boolean));
+          partial = partial || Number(info.totalSupply || 0) > INDEX_MAX_TOKENS;
+        }
+      }
     }
     const capped = ids.slice(0, INDEX_MAX_TOKENS);
 
@@ -1163,7 +1220,8 @@ const api = {
     if (!isAddr(addr)) return json(res, 400, { error: 'bad address' });
     const reg = registry.collections.find(c => c.address === addr) || null;
     const info = await collectionInfo(addr);
-    const orders = await collectionOrders(addr);
+    // A blinked RPC read of the order book must not take the page down.
+    const orders = await collectionOrders(addr).catch(() => []);
     json(res, 200, { registered: !!reg, meta: reg, info, orders });
   },
 
@@ -1196,11 +1254,23 @@ const api = {
     const owner = String(q.get('owner') || '');
     let ownedIds = null;
     if (isAddr(owner)) {
+      let viaStandard = true;
       try {
         const { result } = await cached(`owned:${addr}:${owner}`, 20000,
           async () => nftC(addr).functions.get_tokens_by_owner({ owner, limit: 500 }));
         ownedIds = new Set(result?.token_ids || []);
-      } catch (_) { ownedIds = new Set(); }
+      } catch (_) { viaStandard = false; ownedIds = new Set(); }
+      if (!viaStandard && idx.tokens.length && idx.tokens.length <= 200) {
+        /* Kollection-era contracts only enumerate per owner-and-index;
+           for a small collection it is cheaper to ask owner_of across
+           the whole index than to page that. */
+        const owners = await cached(`owners:${addr}`, 60000, async () =>
+          mapPool(idx.tokens, META_CONCURRENCY, async (t) => ({
+            id: t.tokenId,
+            owner: (await nftC(addr).functions.owner_of({ token_id: t.tokenId })).result?.value || null,
+          })));
+        ownedIds = new Set(owners.filter((o) => o && o.owner === owner).map((o) => o.id));
+      }
     }
 
     let rows = idx.tokens.filter((t) => {

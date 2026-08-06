@@ -393,6 +393,27 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       r413.status === 413 && /larger than/.test(r413.body?.error || ''), JSON.stringify(r413).slice(0, 160));
   }
 
+  /* ---- Kollection-era collections: The Crew, live on mainnet ----
+     No get_tokens (ids are plain decimals probed via owner_of), metadata
+     keyed by hex id on IPFS, royalties declared per 100,000 — a real sale
+     paid 54.10 KOIN royalty on a 1,082 KOIN price, 5%, and the site must
+     say 5%, not 50%. */
+  {
+    const CREW = '1FB7geE8MN1ViG91rkBE5iu27s2Khuo257';
+    const info = await api(`/api/collections/${CREW}`);
+    check('a Kollection-era collection reads name, symbol and supply',
+      info.body?.info?.name === 'The Crew' && info.body?.info?.totalSupply === '60',
+      String(JSON.stringify(info.body)).slice(0, 160));
+    check('…and its per-100k royalty shows as the 5% real sales paid',
+      info.body?.info?.royaltyBps === 500 && info.body?.info?.legacyRoyalty === true,
+      `royaltyBps=${info.body?.info?.royaltyBps} legacy=${info.body?.info?.legacyRoyalty}`);
+
+    const toks = await api(`/api/collections/${CREW}/tokens?limit=5`);
+    check('…its tokens enumerate without get_tokens, probed from the supply',
+      (toks.body?.matched || 0) >= 55 && (toks.body?.tokens || []).length === 5,
+      `matched=${toks.body?.matched} got=${(toks.body?.tokens || []).length}`);
+  }
+
   /* ---- bulk minting: refused whole, or fits whole ---- */
   const twoDucks = [
     { tokenId: '0x4401', name: 'Duck #1', image: 'https://example.com/1.png', attributes: [{ trait_type: 'Rarity', value: 'Common' }] },
