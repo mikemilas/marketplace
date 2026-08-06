@@ -288,8 +288,12 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
       /* The walk paged over the same records twenty times, because the
          FIRST record of an account carries no seq_num at all (protobuf
          omits zero) and every comparison against NaN was false. */
+      /* The market's history grows with every listing, so the bound is
+         relative: a healthy first walk reads each record once (scanned
+         tracks records, and one record can hold several decoded events);
+         the NaN-cursor bug read everything twentyfold. */
       check('…in one pass, instead of paging over the same records again and again',
-        !!body && body.scanned <= 10, `scanned ${body && body.scanned}`);
+        !!body && body.scanned <= (body.known || 0) * 3 + 40, `scanned ${body && body.scanned} known ${body && body.known}`);
 
       const rows = (body && body.events) || [];
       const keys = rows.map(e => [e.seq, e.idx, e.tx, e.kind, e.tokenId, e.price].join('|'));
@@ -412,6 +416,29 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
     check('…its tokens enumerate without get_tokens, probed from the supply',
       (toks.body?.matched || 0) >= 55 && (toks.body?.tokens || []).length === 5,
       `matched=${toks.body?.matched} got=${(toks.body?.tokens || []).length}`);
+
+    // Registered without a cover image, a collection borrows one from its
+    // own newest art — found in the background, PROVEN to load, stored.
+    // The Crew's art is unpinned (every gateway 504s), so the borrowing is
+    // demonstrated on Mata NFT, whose images this site hosts itself.
+    const add = await api('/api/collections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: CREW }),
+    });
+    check('a collection can be added with nothing but its address', add.status === 200, JSON.stringify(add.body).slice(0, 120));
+    const MATA = '17zfwC1PXHLrxwPXkx1ppweiP2dupAgxHk';
+    await api('/api/collections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: MATA }),
+    });
+    let cover = '';
+    for (let i = 0; i < 25 && !cover; i++) {
+      const list = await api('/api/collections');
+      cover = (list.body?.collections || []).find((x) => x.address === MATA)?.image || '';
+      if (!cover) await sleep(1500);
+    }
+    check('…and with no cover chosen, its newest loadable art fronts the collection',
+      /^https:\/\//.test(cover), `image=${cover.slice(0, 80)}`);
   }
 
   /* ---- bulk minting: refused whole, or fits whole ---- */

@@ -1288,16 +1288,21 @@ function paintHeader() {
   $('#btn-me').classList.toggle('hidden', !a);
 }
 
-/* ipfs.io drops content that dweb.link still serves — The Crew's art,
-   for one. When a piece of art dies on one gateway, retry it once on the
-   other. Error events don't bubble, so this listens in capture. */
+/* ipfs.io drops content that dweb.link still serves, and vice versa.
+   When a piece of art dies on one gateway, retry it once on the other.
+   Error events don't bubble, so this listens in capture. */
 document.addEventListener('error', (e) => {
   const img = e.target;
   if (!(img instanceof HTMLImageElement)) return;
   const src = img.currentSrc || img.src || '';
-  if (img.dataset.gwRetried || !/^https:\/\/ipfs\.io\/ipfs\//.test(src)) return;
-  img.dataset.gwRetried = '1';
-  img.src = src.replace('https://ipfs.io/ipfs/', 'https://dweb.link/ipfs/');
+  if (img.dataset.gwRetried) return;
+  if (/^https:\/\/ipfs\.io\/ipfs\//.test(src)) {
+    img.dataset.gwRetried = '1';
+    img.src = src.replace('https://ipfs.io/ipfs/', 'https://dweb.link/ipfs/');
+  } else if (/^https:\/\/dweb\.link\/ipfs\//.test(src)) {
+    img.dataset.gwRetried = '1';
+    img.src = src.replace('https://dweb.link/ipfs/', 'https://ipfs.io/ipfs/');
+  }
 }, true);
 
 (async () => {

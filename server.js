@@ -296,17 +296,15 @@ async function tokenMeta(addr, tokenIdHex) {
     const info = await collectionInfo(addr);
     const base = String(info.uri || '').trim();
     if (!base) return null;
-    const isIpfs = base.startsWith('ipfs://');
-    if (!isIpfs && !/^https?:\/\//.test(base)) return null;
+    if (!/^(https?|ipfs):\/\//.test(base)) return null;
     /* Two file-name conventions exist in the wild — our own launches use
        the human label, Kollection-era drops keyed files by the HEX id
        (…/0x31). And ipfs.io routinely fails content that dweb.link still
-       serves, so an ipfs uri gets a second gateway before giving up. The
-       combination that answers first is remembered per collection, so an
-       index walk pays the discovery timeouts once, not sixty times. */
-    const roots = isIpfs
-      ? ['https://ipfs.io/ipfs/' + base.slice(7), 'https://dweb.link/ipfs/' + base.slice(7)]
-      : [base];
+       serves, so anything with a CID in it gets both gateways before
+       giving up. The combination that answers first is remembered per
+       collection, so an index walk pays the discovery timeouts once, not
+       sixty times. */
+    const roots = ipfsRoots(base) || [base];
     const names = [encodeURIComponent(hexToLabel(tokenIdHex)), tokenIdHex.toLowerCase()];
     const combos = [];
     for (const root of roots) for (const name of names) combos.push({ root, name, idx: combos.length });
@@ -328,6 +326,30 @@ async function tokenMeta(addr, tokenIdHex) {
   });
 }
 const metaPathHints = new Map(); // collection -> canonical index of the combo that answered
+
+/** Anything carrying a CID — ipfs:// uris, subdomain-gateway urls like
+    …cid.ipfs.nftstorage.link (that host is dead, its CIDs sometimes are
+    not) — re-rooted onto gateways that still answer. Returns null when
+    the url carries no CID and should be fetched as-is. */
+function ipfsRoots(base) {
+  let cid = null, sub = '';
+  let m = /^ipfs:\/\/([^/]+)\/?(.*)$/.exec(base);
+  if (m) { cid = m[1]; sub = m[2]; }
+  if (!cid) {
+    m = /^https?:\/\/([a-z0-9]{46,})\.ipfs\.[^/]+\/?(.*)$/i.exec(base);
+    if (m) { cid = m[1]; sub = m[2]; }
+  }
+  if (!cid) {
+    m = /^https?:\/\/[^/]+\/ipfs\/([a-zA-Z0-9]{40,})\/?(.*)$/.exec(base);
+    if (m) { cid = m[1]; sub = m[2]; }
+  }
+  if (!cid) return null;
+  // Some uris embed a second, path-style /ipfs/<cid>/ — re-root there.
+  const inner = /^ipfs\/([a-zA-Z0-9]{40,})\/?(.*)$/.exec(sub);
+  if (inner) { cid = inner[1]; sub = inner[2]; }
+  const tail = sub ? '/' + sub.replace(/\/$/, '') : '';
+  return ['https://ipfs.io/ipfs/' + cid + tail, 'https://dweb.link/ipfs/' + cid + tail];
+}
 
 const rewriteImg = (u) => {
   if (typeof u !== 'string') return null;
@@ -429,8 +451,16 @@ async function collectionIndex(addr) {
     }
     const capped = ids.slice(0, INDEX_MAX_TOKENS);
 
+    /* A collection whose metadata host died (nftstorage.link took whole
+       drops with it) would otherwise spend half an hour timing out once
+       per token. After eight straight misses with no working path ever
+       found, the rest of the walk renders from labels alone — and gets
+       another chance on the next rebuild. */
+    let metaMisses = 0;
     const tokens = (await mapPool(capped, META_CONCURRENCY, async (tid) => {
-      const meta = await tokenMeta(addr, tid).catch(() => null);
+      const giveUp = metaMisses >= 8 && !metaPathHints.has(addr);
+      const meta = giveUp ? null : await tokenMeta(addr, tid).catch(() => null);
+      if (meta) metaMisses = 0; else metaMisses += 1;
       return {
         tokenId: tid, label: hexToLabel(tid),
         name: meta?.name || hexToLabel(tid),
@@ -1040,6 +1070,48 @@ async function sponsor(txJson, ip) {
   }
 }
 
+/* A collection nobody gave a cover image: front it with its most recent
+   active listing's art, or failing that the newest token that has any.
+   Found once, stored in the registry exactly like a hand-picked image —
+   so the cost is paid once, and an owner's later choice still wins by
+   simply replacing the field. */
+const coverBusy = new Set();
+const coverTried = new Map(); // addr -> when the last hunt came up empty
+async function deriveCover(addr) {
+  if (coverBusy.has(addr)) return;
+  const tried = coverTried.get(addr);
+  if (tried && Date.now() - tried < 600000) return;
+  coverBusy.add(addr);
+  try {
+    let img = null;
+    const orders = await collectionOrders(addr).catch(() => []);
+    if (orders.length) {
+      const newest = orders.reduce((a, b) => (Number(b.created || 0) > Number(a.created || 0) ? b : a));
+      img = rewriteImg(((await tokenMeta(addr, newest.tokenId).catch(() => null)) || {}).image);
+    }
+    if (!img) {
+      const idx = await collectionIndex(addr).catch(() => null);
+      const toks = (idx && idx.tokens) || [];
+      for (let i = toks.length - 1; i >= 0 && !img; i--) img = toks[i].image;
+    }
+    /* Unpinned art produces a URL that answers 504 on every gateway — a
+       broken cover reads worse than the placeholder. Persist only a url
+       that demonstrably serves an image, from whichever gateway does. */
+    let proven = null;
+    for (const u of (img ? (ipfsRoots(img) || [img]) : [])) {
+      try {
+        const r = await fetch(u, { signal: AbortSignal.timeout(7000), size: 4194304 });
+        if (r.ok && /^image\//.test(r.headers.get('content-type') || '')) { proven = u; }
+        try { await r.arrayBuffer(); } catch (_) {}
+        if (proven) break;
+      } catch (_) {}
+    }
+    const row = registry.collections.find((x) => x.address === addr);
+    if (proven && row && !row.image) { row.image = proven; saveJson(REGISTRY_FILE, registry); }
+    else coverTried.set(addr, Date.now());
+  } finally { coverBusy.delete(addr); }
+}
+
 /* ---------------- http plumbing ---------------- */
 
 const MIME = {
@@ -1207,6 +1279,9 @@ const api = {
       const info = await collectionInfo(c.address).catch(() => ({ address: c.address }));
       const orders = await collectionOrders(c.address).catch(() => []);
       const floor = orders.length ? orders.reduce((m, o) => BigInt(o.price) < m ? BigInt(o.price) : m, BigInt(orders[0].price)) : null;
+      // No cover chosen? Borrow one from the collection itself — in the
+      // background, so an index build never holds up this listing.
+      if (!c.image) deriveCover(c.address).catch(() => {});
       out.push({
         ...c, ...info,
         listed: orders.length,
