@@ -205,12 +205,32 @@ const Wallet = (() => {
     return send(ops);
   }
 
+  /** koilib's token ABI, minus the btype declaration its protobufjs
+      rejects. KOIN on mainnet is KCS-4 — allowances included. */
+  function koinAbi() {
+    const abi = JSON.parse(JSON.stringify(utils.tokenAbi));
+    const k = abi.koilib_types && abi.koilib_types.nested.koinos && abi.koilib_types.nested.koinos.nested;
+    if (k) { delete k.btype; delete k._btype; }
+    return abi;
+  }
+
   async function buyToken(collection, tokenId, priceSats) {
     const { market } = await loadAbis();
-    const op = await encodeOp(cfg.market, market, 'execute_order', {
-      collection, token_id: tokenId, buyer: account.address, max_price: String(priceSats),
-    });
-    return send([op]);
+    /* The chain stopped letting a contract spend a bare signature: KOIN
+       moves out of a wallet only on an allowance. So the buy grants the
+       market exactly the price, and the market's own transfers consume
+       the whole grant inside execute_order. */
+    const ops = [
+      await encodeOp(cfg.koin, koinAbi(), 'approve', {
+        owner: account.address, spender: cfg.market, value: String(priceSats),
+      }),
+      await encodeOp(cfg.market, market, 'execute_order', {
+        collection, token_id: tokenId, buyer: account.address, max_price: String(priceSats),
+      }),
+    ];
+    // One approve plus one execute_order, which does the work of several
+    // plain calls — budget it like five, matching the sponsor's weighting.
+    return send(ops, { rcLimit: rcFor(5) });
   }
 
   /** Mint into a collection you own, metadata and all, in one transaction.
@@ -219,10 +239,7 @@ const Wallet = (() => {
     const { nft, market } = await loadAbis();
     const ops = [];
     if (Number(cfg.mintFeeKoin) > 0 && cfg.treasury) {
-      const tokenAbi = JSON.parse(JSON.stringify(utils.tokenAbi));
-      const k = tokenAbi.koilib_types && tokenAbi.koilib_types.nested.koinos && tokenAbi.koilib_types.nested.koinos.nested;
-      if (k) { delete k.btype; delete k._btype; }
-      ops.push(await encodeOp(cfg.koin, tokenAbi, 'transfer', {
+      ops.push(await encodeOp(cfg.koin, koinAbi(), 'transfer', {
         from: account.address, to: cfg.treasury,
         value: BigInt(Math.round(Number(cfg.mintFeeKoin) * 1e8)).toString(),
       }));

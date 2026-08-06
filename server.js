@@ -851,6 +851,13 @@ const CREATOR_ENTRIES = new Set([
   NFT_ENTRIES.mint, NFT_ENTRIES.set_metadata,
   NFT_ENTRIES.set_royalties, NFT_ENTRIES.transfer_ownership,
 ].filter(Boolean));
+/* KOIN is KCS-4: a contract spends someone's KOIN only through an
+   allowance, a signature alone stopped being enough chain-wide. So a buy
+   arrives as approve(market, price) + execute_order, and the approve is
+   safe to pay for — it moves nothing, and only the market can consume it,
+   which it only does inside an execute_order the same owner signed. */
+const KOIN_APPROVE_ENTRY = Number((utils.tokenAbi.methods.approve || {}).entry_point || 0);
+const MARKET_EXEC_ENTRY = entryIds(MARKET_ABI).execute_order;
 
 const sponsorHits = new Map();
 function rateLimited(key, max, windowMs) {
@@ -876,8 +883,15 @@ async function sponsor(txJson, ip) {
   try { rc = BigInt(h.rc_limit); } catch (_) { return { status: 400, body: { error: 'bad rc_limit' } }; }
   /* Budget the ceiling against the work actually being authorized, so a
      bigger transaction gets the mana it needs without handing every
-     transaction the maximum. */
-  const opBudget = CFG.SPONSOR_RC_PER_OP * BigInt(tx.operations.length);
+     transaction the maximum. An execute_order counts as several plain
+     calls: inside it are three KOIN transfers, an NFT transfer and the
+     royalty reads. */
+  let opWeight = 0n;
+  for (const op of tx.operations) {
+    const c = op.call_contract;
+    opWeight += (c && c.contract_id === CFG.MARKET_ADDR && Number(c.entry_point) === MARKET_EXEC_ENTRY) ? 4n : 1n;
+  }
+  const opBudget = CFG.SPONSOR_RC_PER_OP * opWeight;
   const ceiling = opBudget < CFG.SPONSOR_RC_MAX ? opBudget : CFG.SPONSOR_RC_MAX;
   if (rc <= 0n || rc > ceiling) {
     return { status: 400, body: { error: 'rc_limit above the sponsorship ceiling' } };
@@ -886,6 +900,7 @@ async function sponsor(txJson, ip) {
   const registered = new Set(registry.collections.map(c => c.address));
   let sawMint = false;
   const feeOps = [];
+  const allowanceOps = [];
   const touched = [];
   for (const op of tx.operations) {
     const call = op.call_contract;
@@ -897,11 +912,30 @@ async function sponsor(txJson, ip) {
     const isCreatorOp = registered.has(target) && CREATOR_ENTRIES.has(entry);
     if (isCreatorOp) touched.push(target);
     if (entry === NFT_ENTRIES.mint && registered.has(target)) sawMint = true;
-    /* The one KOIN transfer this wallet will ever co-sign: the mint fee,
-       exact amount, straight to the treasury, riding beside the mint it
-       pays for. Anything else on the KOIN contract stays refused. */
-    if (target === NET.koinContract && CFG.MINT_FEE_KOIN > 0) { feeOps.push(op); continue; }
+    if (target === NET.koinContract) {
+      /* Two KOIN operations ride the sponsor and nothing else: the
+         allowance that lets the market collect a purchase, and — while a
+         mint fee is set — the fee transfer. Both are decoded and checked
+         below before anything is signed. */
+      if (KOIN_APPROVE_ENTRY && entry === KOIN_APPROVE_ENTRY) { allowanceOps.push(op); continue; }
+      if (CFG.MINT_FEE_KOIN > 0) { feeOps.push(op); continue; }
+      return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
+    }
     if (!isMarket && !isApproval && !isCreatorOp) {
+      return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
+    }
+  }
+  for (const op of allowanceOps) {
+    /* An allowance the payee grants THE MARKET, from their own account —
+       it moves no funds, and only an execute_order the owner signs can
+       ever consume it. Any other owner or spender is someone else's bill. */
+    try {
+      const koinC = new Contract({ id: NET.koinContract, provider, abi: TOKEN_ABI });
+      const dec = await koinC.decodeOperation(op);
+      if (dec.name !== 'approve' || dec.args.owner !== h.payee || dec.args.spender !== CFG.MARKET_ADDR) {
+        return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
+      }
+    } catch (_) {
       return { status: 400, body: { error: 'that operation is not something this wallet pays for' } };
     }
   }

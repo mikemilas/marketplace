@@ -13,7 +13,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { Signer, Provider, Contract, Transaction } = require('koilib');
+const { Signer, Provider, Contract, Transaction, utils } = require('koilib');
 
 const os = require('os');
 const SCRATCH = process.env.TEST_TMP || os.tmpdir();
@@ -322,6 +322,39 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
     const mintOp = await relicsC.encodeOperation({ name: 'mint', args: { to: user.getAddress(), token_id: '0x01' } });
     r = await sponsor(await craft({ ops: [feeOp, mintOp] }));
     check('with free mints, no KOIN transfer rides the sponsor — even beside a mint',
+      r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
+  }
+
+  /* ---- a buy: KOIN allowance to the market + execute_order ----
+     KCS-4 KOIN only leaves a wallet on an allowance, so every purchase
+     arrives as this exact pair. The sponsor must wave the pair through —
+     execute_order weighted as the several calls it makes inside — while
+     an allowance for any OTHER spender stays someone else's bill. */
+  {
+    const tokenAbi = JSON.parse(JSON.stringify(utils.tokenAbi));
+    const k4 = tokenAbi.koilib_types?.nested?.koinos?.nested;
+    if (k4) { delete k4.btype; delete k4._btype; }
+    const koinTokenC = new Contract({ id: '19GYjDBVXU7keLbYvMLazsGQn3GTWHjHkK', abi: tokenAbi, provider });
+    const buyOps = [
+      await koinTokenC.encodeOperation({ name: 'approve',
+        args: { owner: user.getAddress(), spender: MARKET, value: '100000000' } }),
+      await marketC.encodeOperation({ name: 'execute_order',
+        args: { collection: RELICS, token_id: '0x01', buyer: user.getAddress(), max_price: '100000000' } }),
+    ];
+    r = await sponsor(await craft({ ops: buyOps, rcLimit: '1500000000' }));
+    check('a KOIN allowance for the market rides the sponsor beside its buy',
+      !/ceiling|not something|payee|payer/.test(r.body.error || ''), JSON.stringify(r.body).slice(0, 160));
+
+    const strayApprove = await koinTokenC.encodeOperation({ name: 'approve',
+      args: { owner: user.getAddress(), spender: dev.getAddress(), value: '100000000' } });
+    r = await sponsor(await craft({ ops: [strayApprove] }));
+    check('…an allowance for any other spender is refused',
+      r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
+
+    const strayOwner = await koinTokenC.encodeOperation({ name: 'approve',
+      args: { owner: dev.getAddress(), spender: MARKET, value: '100000000' } });
+    r = await sponsor(await craft({ ops: [strayOwner] }));
+    check('…and an allowance from anyone but the payee is refused',
       r.status === 400 && /not something/.test(r.body.error || ''), JSON.stringify(r.body));
   }
 
