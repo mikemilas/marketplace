@@ -445,6 +445,67 @@ async function collectionView(addr, queryString) {
   const arrivedFiltered = state.getAll('t').length > 0 || !!state.get('q') || !!state.get('status');
   if (!arrivedFiltered && data.orders.length) state.set('status', 'listed');
   apply();
+
+  /* Your own unlisted items, listable in one go — the recovery path for a
+     bulk mint whose listing step failed, and the fast path for anyone
+     sitting on a pile. Painted after the grid so it never delays the page,
+     and independent of the filters so the "for sale" default cannot hide
+     the fact that your items exist. */
+  const bulkBar = async () => {
+    if (!Wallet.account) return;
+    const me = Wallet.account.address;
+    const myLayout = view.querySelector('.c-layout');
+    const mine = [];
+    let offset = 0;
+    for (let guard = 0; guard < 25; guard++) {
+      const q = await api(`/collections/${addr}/tokens?owner=${me}&status=unlisted&limit=60&offset=${offset}`).catch(() => null);
+      if (!q) return;
+      mine.push(...q.tokens);
+      if (q.nextOffset == null) break;
+      offset = q.nextOffset;
+    }
+    // Only decorate the page this was started for — not whatever replaced it.
+    if (mine.length < 2 || !myLayout.isConnected || $('#c-bulklist')) return;
+    view.querySelector('.c-toolbar').insertAdjacentHTML('beforebegin', `
+      <div class="bulk-bar" id="c-bulklist">
+        <span><b>${mine.length}</b> of your items here are not for sale.</span>
+        <div class="price-field">
+          <input id="bl-price" type="number" min="0" step="0.00000001" placeholder="price each" inputmode="decimal">
+          <span>KOIN</span>
+        </div>
+        <button class="btn primary" id="bl-go">List all ${mine.length}</button>
+      </div>`);
+    $('#bl-go').onclick = async () => {
+      const koin = parseFloat($('#bl-price').value);
+      if (!(koin > 0)) { toast('Set a price in KOIN first', 'bad', 4000); $('#bl-price').focus(); return; }
+      const priceSats = BigInt(Math.round(koin * 1e8)).toString();
+      const btn = $('#bl-go');
+      btn.disabled = true; $('#bl-price').disabled = true;
+      btn.innerHTML = '<span class="spin"></span> Listing…';
+      try {
+        await Wallet.listTokens(addr, mine.map((t) => ({ tokenId: t.tokenId, priceSats })), {
+          onProgress: (done, total) => { btn.innerHTML = `<span class="spin"></span> Listed ${done} of ${total}…`; },
+        });
+        /* The last chunk returns the moment it is sent; wait for its final
+           order to be readable before repainting the shopfront. */
+        const lastId = mine[mine.length - 1].tokenId;
+        for (let w = 0; w < 10; w++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const d = await api(`/collections/${addr}/token/${encodeURIComponent(lastId)}`).catch(() => null);
+          if (d && d.order && !d.order.dead) break;
+        }
+        toast(`🎉 All ${mine.length} listed at ${koin} KOIN`, 'good', 8000);
+        $('#c-bulklist')?.remove();
+        state.set('status', 'listed');
+        apply();
+      } catch (e) {
+        toast(esc(e.message), 'bad', 10000);
+        btn.disabled = false; $('#bl-price').disabled = false;
+        btn.textContent = `List all ${mine.length}`;
+      }
+    };
+  };
+  bulkBar().catch(() => {});
 }
 
 async function tokenView(addr, tokenId) {
@@ -1167,7 +1228,9 @@ async function createMint(body, me, info = {}) {
         if (toList.length) {
           go.innerHTML = `<span class="spin"></span> Listing ${toList.length} for sale…`;
           try {
-            await Wallet.listTokens(collection, toList);
+            await Wallet.listTokens(collection, toList, {
+              onProgress: (done, total) => { go.innerHTML = `<span class="spin"></span> Listed ${done} of ${total}…`; },
+            });
             toast(`🎉 ${d.minted.length} minted, ${toList.length} listed for sale`, 'good', 8000);
           } catch (e) {
             toast(`Minted ${d.minted.length}, but listing failed: ${esc(e.message)} — list them from their item pages.`, 'bad', 10000);

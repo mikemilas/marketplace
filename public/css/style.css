@@ -338,6 +338,16 @@ textarea:focus { outline: none; border-color: var(--accent); }
   border-radius: 8px; padding: 10px 12px; font-size: 13.5px; margin: 12px 0;
 }
 .warn a { color: var(--accent); }
+/* The one-shot shopfront bar for your unlisted items on a collection page. */
+.bulk-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; font-size: 14px;
+}
+.bulk-bar .price-field { flex: 0 1 auto; }
+.bulk-bar .price-field input { width: 130px; font-size: 16px; }
+.bulk-bar .btn { white-space: nowrap; }
 /* Artwork: the preview is the point, so it leads. */
 .art-pick { display: grid; grid-template-columns: 96px 1fr; gap: 12px; align-items: start; }
 .art-prev {

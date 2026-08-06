@@ -216,6 +216,42 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('a shared filter URL reopens filtered, with the box still ticked',
     reloaded.count.startsWith(String(rareCount)) && reloaded.checked, JSON.stringify(reloaded));
 
+  /* ---- your unlisted items can be listed in one go ---- */
+  // The bar wants a wallet owning unlisted items here; own that answer
+  // instead of depending on live chain ownership.
+  const ownerQuery = (url) => url.pathname === `/api/collections/${RELICS}/tokens` && url.searchParams.has('owner');
+  await page.route(ownerQuery, (r) => r.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      tokens: [
+        { tokenId: '0x4141', label: 'AA', name: 'Relic AA', image: null, order: null },
+        { tokenId: '0x4242', label: 'BB', name: 'Relic BB', image: null, order: null },
+        { tokenId: '0x4343', label: 'CC', name: 'Relic CC', image: null, order: null },
+      ],
+      matched: 3, indexed: 82, partial: false, nextOffset: null,
+    }),
+  }));
+  await page.evaluate((addr) => {
+    Object.defineProperty(Wallet, 'account', { get: () => ({ kind: 'hosted', address: addr }), configurable: true });
+  }, '1NBe6YWf2JAqy5Eh2rQjb6jCRiwe47vyU');
+  await page.evaluate(() => route());
+  await page.waitForSelector('#c-bulklist', { timeout: 30000 });
+  const bulkBar = await page.evaluate(() => ({
+    text: document.querySelector('#c-bulklist').innerText,
+    hasPrice: !!document.querySelector('#bl-price'),
+    button: document.querySelector('#bl-go').textContent,
+  }));
+  check('owning unlisted items in a collection offers to list them all at once',
+    /3/.test(bulkBar.text) && bulkBar.hasPrice, JSON.stringify(bulkBar));
+  check('…and the button says how many it will list', /List all 3/.test(bulkBar.button), bulkBar.button);
+  await page.click('#bl-go');
+  await page.waitForFunction(() => /Set a price/.test(document.querySelector('#toasts')?.innerText || ''), { timeout: 10000 });
+  check('…but refuses to list at no price rather than listing at zero', true, '');
+  await page.unroute(ownerQuery);
+  // Hash-only navigations share one document, so a toast outlives its page —
+  // sweep it up before a later test reads the container.
+  await page.evaluate(() => { document.querySelector('#toasts').innerHTML = ''; delete Wallet.account; });
+
   /* ---- the item page hands listing to its own page ---- */
   const owned = await (await fetch(`http://127.0.0.1:${PORT}/api/collections/${RELICS}/token/${TOKEN}`)).json();
   await page.goto(`http://127.0.0.1:${PORT}/#/t/${RELICS}/${TOKEN}`, { waitUntil: 'load' });

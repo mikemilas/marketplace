@@ -249,14 +249,16 @@ const Wallet = (() => {
       then an order per token. Listing is the one thing the collection
       cannot sign for its owner — an order moves YOUR property, so YOUR
       authority creates it (silent for hosted keys, one Kondor popup). */
-  async function listTokens(collection, entries) {
+  async function listTokens(collection, entries, { onProgress = null } = {}) {
     const { market, nft } = await loadAbis();
     if (!entries.length) return null;
-    /* ~1 KOIN of mana per operation against a 15 KOIN sponsor ceiling:
-       ten orders plus their approval per transaction, then start the next
-       one — waiting for the previous chunk to reach the chain, because
+    /* Measured on mainnet: an approval plus one order burns 3.46 KOIN, so
+       a chunk of ten orders needs ~19 — past the 15 KOIN sponsor ceiling,
+       and the whole transaction reverts with nothing listed. Five orders
+       plus the approval stays near 12 whichever way the cost splits. Each
+       chunk then waits for the previous one to reach the chain, because
        two transactions from one account cannot share a nonce. */
-    const CHUNK = 10;
+    const CHUNK = 5;
     let last = null;
     for (let at = 0; at < entries.length; at += CHUNK) {
       const slice = entries.slice(at, at + CHUNK);
@@ -276,6 +278,7 @@ const Wallet = (() => {
         }));
       }
       last = await send(ops);
+      if (onProgress) { try { onProgress(Math.min(at + CHUNK, entries.length), entries.length); } catch (_) {} }
       if (at + CHUNK < entries.length) {
         // The next chunk needs this one's nonce settled on chain first.
         for (let w = 0; w < 15; w++) {
