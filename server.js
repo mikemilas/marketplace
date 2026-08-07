@@ -1293,6 +1293,25 @@ const api = {
 
   async collection(req, res, addr) {
     if (!isAddr(addr)) return json(res, 400, { error: 'bad address' });
+    if (req.method === 'DELETE') {
+      /* Registration's undo, behind the same admin key that curates the
+         registry. Removal only unlists from THIS site — tokens, owners
+         and any on-chain orders are untouched, so a removal with live
+         listings is refused unless forced, to keep the book honest. */
+      const body = await readBody(req).catch(() => ({}));
+      const key = String(body.key || new URL(req.url, 'http://localhost').searchParams.get('key') || '');
+      if (!CFG.ADMIN_KEY || key !== CFG.ADMIN_KEY) return json(res, 403, { error: 'the admin key opens this door' });
+      const at = registry.collections.findIndex((c) => c.address === addr);
+      if (at < 0) return json(res, 404, { error: 'not registered' });
+      const live = await collectionOrders(addr).catch(() => []);
+      if (live.length && !body.force) {
+        return json(res, 400, { error: `${live.length} live listing(s) — cancel them first, or pass force:true to unlist the collection anyway (the orders stay on chain)` });
+      }
+      registry.collections.splice(at, 1);
+      saveJson(REGISTRY_FILE, registry);
+      forgetCollection(addr);
+      return json(res, 200, { ok: true, removed: addr });
+    }
     const reg = registry.collections.find(c => c.address === addr) || null;
     const info = await collectionInfo(addr);
     // A blinked RPC read of the order book must not take the page down.

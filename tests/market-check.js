@@ -439,6 +439,21 @@ process.on('exit', () => { try { srv && srv.kill(); } catch (_) {} });
     }
     check('…and with no cover chosen, its newest loadable art fronts the collection',
       /^https:\/\//.test(cover), `image=${cover.slice(0, 80)}`);
+
+    // Registered by mistake? The admin key takes it back out — nobody else.
+    let del = await api(`/api/collections/${CREW}`, {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'not-the-key' }),
+    });
+    check('removing a collection demands the admin key', del.status === 403, JSON.stringify(del.body));
+    del = await api(`/api/collections/${CREW}`, {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'test-admin-key' }),
+    });
+    const after = await api('/api/collections');
+    check('…and with it, the collection leaves the registry',
+      del.status === 200 && !(after.body?.collections || []).some((x) => x.address === CREW),
+      JSON.stringify(del.body));
   }
 
   /* ---- bulk minting: refused whole, or fits whole ---- */
